@@ -164,6 +164,34 @@ class TestCreateAttentionBackend:
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,
     )
+    def test_deepseek_v4_creates_dsa_backend(self, _mock_is_npu):
+        attn = _make_attention_layer(head_dim=512)
+        module = types.ModuleType("xllm.python.attention.dsa_attention")
+        module.DsaAttentionBackend = StubAttentionBackend
+        config = {
+            "model_type": "deepseek_v4",
+            "compress_ratios": [1, 4, 128],
+            "num_hidden_layers": 3,
+            "window_size": 128,
+            "index_topk": 512,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "qk_rope_head_dim": 64,
+        }
+        with patch.dict(sys.modules, {module.__name__: module}):
+            backend = _create_attention_backend(
+                attn, torch.device("npu"), torch.bfloat16, config
+            )
+
+        assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["attn_head_dim"] == 512
+        assert backend.init_kwargs["n_layers"] == 3
+        assert backend.init_kwargs["compress_ratios"] == [1, 4, 128]
+
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
     @patch(
         "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
         StubAttentionBackend,

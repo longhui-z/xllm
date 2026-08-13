@@ -141,6 +141,25 @@ class MlaIndexContext:
     update_index_cache: Callable[[torch.Tensor], None]
 
 
+@dataclass(frozen=True)
+class DsaIndexContext:
+    """Per-forward cache and metadata view consumed by the DSV4 indexer."""
+
+    index_cache: torch.Tensor
+    indexer_scale: torch.Tensor | None
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor | None
+    cmp_block_table: torch.Tensor | None
+    kv_state: torch.Tensor | None
+    score_state: torch.Tensor | None
+    kv_block_table: torch.Tensor | None
+    score_block_table: torch.Tensor | None
+    actual_seq_q: torch.Tensor
+    actual_seq_kv: torch.Tensor
+    start_pos: torch.Tensor | None
+    qli_metadata: torch.Tensor | None
+
+
 class AttentionBackend(ABC):
     @abstractmethod
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
