@@ -19,6 +19,8 @@ Pure-Python: does not load compiled operators or weights.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import pytest
 
@@ -30,7 +32,7 @@ from xllm.python.models.deepseek_v4 import (
     DeepseekV4Model,
     DeepseekV4RotaryEmbedding,
 )
-from xllm.python.models import deepseek_v32
+from xllm.python.models import deepseek_v32, deepseek_v4
 from xllm.python.models.deepseek_v32 import W8A8DynamicLinear, _swiglu_with_clamp
 from xllm.python.registry import get_model_class
 
@@ -289,3 +291,79 @@ def test_moe_uses_dedicated_group_sizes() -> None:
     assert moe.moe_tp_size == 1
     assert moe.moe_tp_rank == 0
     assert moe.start_expert_id == 3 * (cfg.n_routed_experts // cfg.ep_size)
+
+
+def test_moe_tp_ep_reduction_order_matches_cpp(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class FakeDistributed:
+        @staticmethod
+        def moe_tp_all_reduce(tensor: torch.Tensor) -> None:
+            calls.append("moe_tp")
+            tensor.add_(10)
+
+        @staticmethod
+        def moe_ep_all_reduce(tensor: torch.Tensor) -> None:
+            calls.append("moe_ep")
+            tensor.add_(100)
+
+    monkeypatch.setattr(deepseek_v4, "distributed", FakeDistributed)
+    owner = SimpleNamespace(
+        cfg=SimpleNamespace(ep_size=2, tp_size=1),
+        moe_tp_size=2,
+    )
+    routed = torch.zeros(2)
+    shared = torch.ones(2)
+
+    output = DeepseekV4MoE._reduce_moe_outputs(owner, routed, shared)
+
+    assert calls == ["moe_tp", "moe_ep", "moe_tp"]
+    assert torch.equal(output, torch.full((2,), 121.0))
+
+
+def test_moe_ep_only_reduces_routed_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class FakeDistributed:
+        @staticmethod
+        def moe_ep_all_reduce(tensor: torch.Tensor) -> None:
+            calls.append("moe_ep")
+            tensor.add_(100)
+
+    monkeypatch.setattr(deepseek_v4, "distributed", FakeDistributed)
+    owner = SimpleNamespace(
+        cfg=SimpleNamespace(ep_size=2, tp_size=1),
+        moe_tp_size=1,
+    )
+
+    output = DeepseekV4MoE._reduce_moe_outputs(
+        owner, torch.zeros(1), torch.ones(1)
+    )
+
+    assert calls == ["moe_ep"]
+    assert torch.equal(output, torch.full((1,), 101.0))
+
+
+def test_moe_tp_only_combines_before_one_reduce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeDistributed:
+        @staticmethod
+        def moe_tp_all_reduce(tensor: torch.Tensor) -> None:
+            calls.append("moe_tp")
+            tensor.mul_(2)
+
+    monkeypatch.setattr(deepseek_v4, "distributed", FakeDistributed)
+    owner = SimpleNamespace(
+        cfg=SimpleNamespace(ep_size=1, tp_size=2),
+        moe_tp_size=2,
+    )
+
+    output = DeepseekV4MoE._reduce_moe_outputs(
+        owner, torch.full((1,), 2.0), torch.full((1,), 3.0)
+    )
+
+    assert calls == ["moe_tp"]
+    assert torch.equal(output, torch.full((1,), 10.0))

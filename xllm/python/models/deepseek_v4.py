@@ -1287,30 +1287,40 @@ class DeepseekV4MoE(nn.Module):
             self.num_total_experts, self.start_expert_id, self.num_experts_per_rank,
             self.cfg.swiglu_limit,
         )
-        # 4) Shared experts + EP all-reduce + TP all-reduce.
+        # 4) Shared experts + C++-ordered TP/EP reductions.
         shared_out = self.shared_experts(hidden)
 
+        return self._reduce_moe_outputs(routed_out, shared_out)
+
+    def _reduce_moe_outputs(
+        self, routed_out: torch.Tensor, shared_out: torch.Tensor
+    ) -> torch.Tensor:
+        """Reduce routed/shared results in the C++ ``FusedMoEImpl`` order.
+
+        With both MoE TP and EP enabled, routed and shared outputs are partial
+        on different dimensions.  C++ reduces each partial over MoE TP first,
+        reduces routed over MoE EP, then reduces shared over MoE TP before
+        adding the two results (fused_moe.cpp:2158-2181).  Keeping this order
+        also keeps every rank in both process groups in the same collective
+        sequence.
+        """
         ep_size = self.cfg.ep_size if self.cfg.ep_size > 0 else self.cfg.tp_size
+        if distributed is None and (ep_size > 1 or self.moe_tp_size > 1):
+            raise RuntimeError("Python distributed collectives are unavailable")
+
         if ep_size > 1:
-            if self.moe_tp_size != 1:
-                raise RuntimeError(
-                    "Python DSV4 MoE requires dedicated moe_tp/moe_ep process "
-                    "groups when both groups have more than one rank"
-                )
-            # C++ first reduces routed experts across moe_ep_group, then adds
-            # the already-complete TP1 shared-expert output.
-            if distributed is None:
-                raise RuntimeError("Python distributed collectives are unavailable")
-            distributed.all_reduce_(routed_out, "moe_ep")
-            out = routed_out + shared_out
-        else:
-            out = routed_out + shared_out
             if self.moe_tp_size > 1:
-                # EP1: moe_tp_group is the global TP group, so routed and
-                # shared partials can be combined before one reduction.
-                if distributed is None:
-                    raise RuntimeError("Python distributed collectives are unavailable")
-                distributed.all_reduce_(out, "moe_tp")
+                distributed.moe_tp_all_reduce(routed_out)
+            distributed.moe_ep_all_reduce(routed_out)
+            if self.moe_tp_size > 1:
+                distributed.moe_tp_all_reduce(shared_out)
+            return routed_out + shared_out
+
+        out = routed_out + shared_out
+        if self.moe_tp_size > 1:
+            # EP1: routed and shared partials can be combined before one
+            # reduction, matching C++'s reduce(a + b) fast path.
+            distributed.moe_tp_all_reduce(out)
         return out
 
 

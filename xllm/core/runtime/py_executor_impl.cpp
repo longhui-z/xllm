@@ -41,6 +41,11 @@ namespace py = pybind11;
 namespace xllm {
 namespace {
 
+// Python collective wrappers call back into the C++ ProcessGroups owned by
+// the model. The executor is single-threaded per worker, but thread-local
+// storage keeps concurrent workers isolated.
+thread_local PyCausalLM* active_py_causal_lm = nullptr;
+
 py::object optional_tensor(const torch::Tensor& tensor) {
   return tensor.defined() ? py::cast(tensor) : py::none();
 }
@@ -68,6 +73,34 @@ void clear_python_object(py::object& object) {
 
 PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
   register_attention_metadata_views(m);
+
+  // Reuse native C++ process groups instead of creating a second HCCL
+  // communicator from Python. These functions are valid only during a model
+  // forward, while PyExecutorImpl has set active_py_causal_lm.
+  m.def("tp_all_reduce", [](torch::Tensor tensor) {
+    if (active_py_causal_lm != nullptr) {
+      active_py_causal_lm->tp_all_reduce(tensor);
+    }
+    return tensor;
+  });
+  m.def("tp_all_gather", [](torch::Tensor tensor, int64_t dim) {
+    if (active_py_causal_lm != nullptr) {
+      return active_py_causal_lm->tp_all_gather(tensor, dim);
+    }
+    return tensor;
+  });
+  m.def("moe_tp_all_reduce", [](torch::Tensor tensor) {
+    if (active_py_causal_lm != nullptr) {
+      active_py_causal_lm->moe_tp_all_reduce(tensor);
+    }
+    return tensor;
+  });
+  m.def("moe_ep_all_reduce", [](torch::Tensor tensor) {
+    if (active_py_causal_lm != nullptr) {
+      active_py_causal_lm->moe_ep_all_reduce(tensor);
+    }
+    return tensor;
+  });
 
 #if defined(USE_NPU)
   py::class_<NPULayerSynchronizerImpl,
@@ -102,7 +135,12 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                             options_.max_seqs_per_batch());
 }
 
-PyExecutorImpl::~PyExecutorImpl() { clear_python_object(py_executor_); }
+PyExecutorImpl::~PyExecutorImpl() {
+  if (active_py_causal_lm == py_causal_lm_) {
+    active_py_causal_lm = nullptr;
+  }
+  clear_python_object(py_executor_);
+}
 
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {
   return batch.prepare_forward_input(
@@ -115,6 +153,9 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                 const ModelInputParams& params) {
   torch::NoGradGuard no_grad;
   COUNTER_INC(num_model_execution_total_eager);
+  // Keep this active through the subsequent PyCausalLM::logits() call: the
+  // sharded lm_head performs its TP gather after execute() returns.
+  active_py_causal_lm = py_causal_lm_;
 
   // Build or reuse attention metadata.
   std::shared_ptr<layer::AttentionMetadata> attn_metadata =
