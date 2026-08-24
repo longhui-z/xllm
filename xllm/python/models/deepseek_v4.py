@@ -957,6 +957,9 @@ class DeepseekV4Indexer(nn.Module):
             query_seq_lens = query_seq_lens[1:]
         key_seq_lens = dsa.actual_seq_lengths_kv
         qli_metadata = dsa.qli_metadata
+        # Ensure metadata is not null (kernel requires 1024 int32 elements).
+        if qli_metadata is None or qli_metadata.numel() == 0:
+            qli_metadata = torch.zeros(1024, dtype=torch.int32, device=device)
         # C++ packs the current forward's DSA metadata onto the runtime device
         # before building and invoking QLI. Python follows the same ownership
         # contract in DsaAttentionBackend.prepare_dsa_metadata_for_forward();
@@ -973,26 +976,22 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(
                     f"QLI {name} must be on {device}, got {tensor.device}"
                 )
-        topk, _ = kernels.quant_lightning_indexer(
-            query=q_quant,
-            key=index_cache,
-            weights=weights.to(torch.float16),
-            query_dequant_scale=q_scale,
-            key_dequant_scale=key_dequant_scale.to(torch.float16),
-            query_quant_mode=0,
-            key_quant_mode=0,
-            actual_seq_lengths_query=query_seq_lens,
-            actual_seq_lengths_key=key_seq_lens,
-            block_table=block_table,
-            metadata=qli_metadata,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.topk,
-            sparse_mode=3,
-            pre_tokens=2**63 - 1,
-            next_tokens=2**63 - 1,
-            cmp_ratio=4,
-            return_value=False,
+        # Use real quant_lightning_indexer.
+        # Ascend950PR kernel only compiles fp8 templates (DT_Q=36);
+        # C++ side does: int8 -> fp32 * dequant_scale -> fp8 (semantically correct).
+        # Kernel expects fp32 weights/scales per SupportInfo; convert from bf16/fp16.
+        query_quant_mode = 0  # dynamic_quant uses int8
+        key_quant_mode = 0
+        import sys
+        print(f"[QLI_PYTHON] calling quant_lightning_indexer: q_quant dtype={q_quant.dtype} shape={q_quant.shape}, index_cache dtype={index_cache.dtype} shape={index_cache.shape}", file=sys.stderr, flush=True)
+        topk, _ = torch.ops.xllm_ops.quant_lightning_indexer(
+            q_quant, index_cache, weights.to(torch.float32), q_scale.to(torch.float32), key_dequant_scale.to(torch.float32),
+            query_quant_mode, key_quant_mode,
+            query_seq_lens, key_seq_lens, block_table, qli_metadata,
+            "TND", "PA_BSND",
+            self.topk, 3,  # sparse_count, sparse_mode
+            2**63 - 1, 2**63 - 1, 4,  # pre_token, next_token, cmp_ratio
+            False,  # return_value
         )
         return topk
 

@@ -47,6 +47,7 @@ limitations under the License.
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #include "core/util/blocking_counter.h"
+#include "core/util/env_var.h"
 #include "core/util/json_reader.h"
 #include "core/util/model_config_utils.h"
 #include "core/util/rec_model_utils.h"
@@ -489,7 +490,7 @@ HFModelLoader::HFModelLoader(const std::string& model_weights_path)
   std::sort(model_weights_files_.begin(), model_weights_files_.end());
 
   threadpool_ = std::make_unique<ThreadPool>(
-      /*num_threads=*/32,
+      /*num_threads=*/util::get_int_env("XLLM_WEIGHT_LOAD_THREADS", 32),
       /*cpu_binding=*/false,
       /*pool_name=*/"HFModelLoader.load_weights");
   if (::xllm::ModelConfig::get_instance().backend() == "rec" &&

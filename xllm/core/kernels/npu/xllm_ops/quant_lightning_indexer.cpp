@@ -111,6 +111,52 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
                                                       return_value);
   at::Tensor sparse_indices_out = std::get<0>(quant_lightning_indexer_output);
   at::Tensor sparse_values_out = std::get<1>(quant_lightning_indexer_output);
+
+  // Convert int8 query/key to fp8 if needed (Ascend950PR kernel only supports
+  // fp8). If already fp8, skip. Otherwise: int8 -> fp32 * dequant_scale -> fp8
+  // via CPU.
+  auto ensure_fp8 = [](const at::Tensor& t,
+                       const at::Tensor& dequant_scale) -> at::Tensor {
+    fprintf(stderr,
+            "[QLI_DEBUG] ensure_fp8 ENTER scalar_type=%d\n",
+            static_cast<int>(t.scalar_type()));
+    fflush(stderr);
+    if (t.scalar_type() == at::kFloat8_e4m3fn) {
+      fprintf(stderr, "[QLI_DEBUG] already fp8, skip\n");
+      fflush(stderr);
+      return t;  // Already fp8, no conversion needed
+    }
+    // int8 -> fp32 -> dequant (multiply by scale) -> fp8
+    auto t_cpu = t.cpu();
+    auto t_fp32 = t_cpu.to(at::kFloat);
+    // Broadcast dequant_scale to match t's shape for element-wise multiply
+    auto scale_cpu = dequant_scale.cpu().to(at::kFloat);
+    // scale shape is [B, 1] or [B], broadcast to [B, ..., HD]
+    while (scale_cpu.dim() < t_fp32.dim()) {
+      scale_cpu = scale_cpu.unsqueeze(-1);
+    }
+    auto t_dequant = t_fp32 * scale_cpu;
+    // Debug: force output via fprintf
+    fprintf(stderr, "[QLI_DEBUG] int8 shape=[");
+    for (auto s : t.sizes()) fprintf(stderr, "%ld,", s);
+    fprintf(stderr, "] scale shape=[");
+    for (auto s : dequant_scale.sizes()) fprintf(stderr, "%ld,", s);
+    fprintf(stderr,
+            "] int8 rng=[%.4f,%.4f] scale rng=[%.6f,%.6f] dequant "
+            "rng=[%.4f,%.4f]\n",
+            t_cpu.min().item<float>(),
+            t_cpu.max().item<float>(),
+            dequant_scale.cpu().min().item<float>(),
+            dequant_scale.cpu().max().item<float>(),
+            t_dequant.min().item<float>(),
+            t_dequant.max().item<float>());
+    fflush(stderr);
+    auto t_fp8 = t_dequant.to(at::kFloat8_e4m3fn);
+    return t_fp8.to(t.device());
+  };
+  auto query_fp8 = ensure_fp8(query, query_dequant_scale);
+  auto key_fp8 = ensure_fp8(key, key_dequant_scale);
+
   // convert str
   char* query_layout_ptr = const_cast<char*>(query_layout_str.c_str());
   char* key_layout_ptr = const_cast<char*>(key_layout_str.c_str());
@@ -118,8 +164,8 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
   const int64_t scale_stride_dim0 = key_dequant_scale.stride(0);
 
   EXEC_NPU_CMD(aclnnQuantLightningIndexer,
-               query,
-               key,
+               query_fp8,
+               key_fp8,
                weights,
                query_dequant_scale,
                key_dequant_scale,

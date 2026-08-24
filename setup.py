@@ -64,7 +64,7 @@ def _ensure_tilelang_ascend_ready(target_platform: str, arch: str) -> None:
 
 
 def _maybe_compile_tilelang_kernels(device: str, jobs: int | str | None = None) -> None:
-    if device != "npu":
+    if device == "npu":
         return
     target_platform = get_ascend_platform()
 

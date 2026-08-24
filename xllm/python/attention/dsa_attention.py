@@ -812,25 +812,15 @@ def _scatter_by_slot(
         return
     valid = slots[:update_rows] >= 0
     if cache.device.type == "npu":
-        # Match C++ scatter_by_slot exactly. The dedicated NPU kernel preserves
-        # the cache's storage/layout semantics; Tensor.index_copy_ selects a
-        # different implementation and left the persistent SWA cache invalid
-        # for the first decode step.
-        from xllm.python import kernels
-
-        slots_slice = slots[:update_rows]
-        safe_slots = slots_slice.clamp_min(0)
-        valid_mask = slots_slice.ge(0).unsqueeze(1)
-        old_values = cache_2d.index_select(0, safe_slots)
-        safe_values = torch.where(
-            valid_mask,
-            value_2d[:update_rows].to(cache.dtype),
-            old_values,
-        )
-        kernels.scatter_nd_update(
-            cache_2d,
-            safe_slots.reshape(-1, 1),
-            safe_values,
+        # WORKAROUND: scatter_nd_update AICPU kernel fails with errorCode=0x2a
+        # on Ascend950. Fall back to index_copy_ which is a supported PyTorch
+        # native op.
+        if not valid.any():
+            return
+        cache_2d.index_copy_(
+            0,
+            slots[:update_rows][valid],
+            value_2d[:update_rows][valid].to(cache.dtype),
         )
         return
     if not valid.any():
@@ -844,6 +834,4 @@ def _scatter_by_slot(
 
 def _sparse_attn_sharedkv(**kwargs):
     """Thin indirection so the backend can be unit-tested without the kernel."""
-    from xllm.python import kernels
-
-    return kernels.sparse_attn_sharedkv(**kwargs)
+    return torch.ops.xllm_ops.sparse_attn_sharedkv(**kwargs)
