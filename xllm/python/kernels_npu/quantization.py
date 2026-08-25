@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import torch
 
+from xllm.python import dsa_dump
+
 
 def quant_matmul(
     x1: torch.Tensor,
@@ -97,9 +99,17 @@ def dynamic_quant(
     Returns:
         The quantized tensor and its per-token scale.
     """
-    return torch.ops.xllm_ops.dynamic_quant(
+    out = torch.ops.xllm_ops.dynamic_quant(
         value, smooth_scales, group_index, dst_type
     )
+    dsa_dump.snap(
+        "dynamic_quant",
+        {"value": value, "smooth_scales": smooth_scales, "group_index": group_index},
+        extra={"dst_type": str(dst_type)},
+    )
+    if out[1] is not None:
+        dsa_dump.snap("dynamic_quant_out", {"quantized": out[0], "scale": out[1]})
+    return out
 
 
 __all__ = ["quant_matmul", "quantize_per_tensor", "dynamic_quant"]

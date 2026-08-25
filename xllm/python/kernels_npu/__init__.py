@@ -50,6 +50,8 @@ from .dsa import (
     moe_gating_top_k_hash,
     quant_lightning_indexer,
     quant_lightning_indexer_metadata,
+    quant_lightning_indexer_v2,
+    quant_lightning_indexer_v2_metadata,
     sparse_attn_sharedkv,
     sparse_attn_sharedkv_metadata,
 )
@@ -136,6 +138,8 @@ __all__ = [
     "moe_gating_top_k_hash",
     "quant_lightning_indexer",
     "quant_lightning_indexer_metadata",
+    "quant_lightning_indexer_v2",
+    "quant_lightning_indexer_v2_metadata",
     "sparse_attn_sharedkv",
     "sparse_attn_sharedkv_metadata",
     "resolve_gdn_prefill_backend",

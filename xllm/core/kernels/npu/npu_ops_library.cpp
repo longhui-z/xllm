@@ -435,6 +435,25 @@ TORCH_LIBRARY(xllm_ops, m) {
       "batch_size, int max_seqlen_q, int max_seqlen_k, str layout_query, str "
       "layout_key, int sparse_count, int sparse_mode, int pre_tokens, int "
       "next_tokens, int cmp_ratio, str device) -> Tensor");
+  // Quantized lightning indexer V2: int8 q/k native, no fp8 conversion.
+  m.def(
+      "quant_lightning_indexer_v2(Tensor q, Tensor k, Tensor w, "
+      "Tensor q_descale, Tensor k_descale, Tensor? cu_seqlens_q, "
+      "Tensor? cu_seqlens_k, Tensor? seqused_q, Tensor? seqused_k, "
+      "Tensor? cmp_residual_k, Tensor? block_table, "
+      "Tensor? output_idx_offset, Tensor? metadata, "
+      "int num_heads_q, int num_heads_k, int head_dim, "
+      "int topk, int quant_mode, int max_seqlen_q, "
+      "str layout_q, str layout_k, int mask_mode, int cmp_ratio, "
+      "int return_value) -> (Tensor, Tensor)");
+  // AICPU tiling metadata builder for quant_lightning_indexer_v2.
+  m.def(
+      "quant_lightning_indexer_v2_metadata(Tensor? cu_seqlens_q, Tensor? "
+      "cu_seqlens_k, Tensor? seqused_q, Tensor? seqused_k, Tensor? "
+      "cmp_residual_k, int num_heads_q, int num_heads_k, int head_dim, "
+      "int topk, int quant_mode, int batch_size, int max_seqlen_q, "
+      "int max_seqlen_k, str layout_q, str layout_k, "
+      "int mask_mode, int cmp_ratio, str device) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -486,4 +505,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer));
   m.impl("quant_lightning_indexer_metadata",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_metadata));
+  m.impl("quant_lightning_indexer_v2",
+         TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_v2));
+  m.impl("quant_lightning_indexer_v2_metadata",
+         TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_v2_metadata));
 }

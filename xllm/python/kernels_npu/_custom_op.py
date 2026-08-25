@@ -762,3 +762,83 @@ register_fake(
     "xllm_ops::quant_lightning_indexer_metadata",
     _quant_lightning_indexer_metadata_fake,
 )
+
+
+def _quant_lightning_indexer_v2_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_q: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    cmp_residual_k: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    output_idx_offset: torch.Tensor | None,
+    metadata: torch.Tensor | None,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    topk: int,
+    quant_mode: int,
+    max_seqlen_q: int,
+    layout_q: str,
+    layout_k: str,
+    mask_mode: int,
+    cmp_ratio: int,
+    return_value: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del (
+        w, q_descale, k_descale, cu_seqlens_q, cu_seqlens_k, seqused_q,
+        seqused_k, cmp_residual_k, block_table, output_idx_offset, metadata,
+        num_heads_q, head_dim, quant_mode, max_seqlen_q, mask_mode, cmp_ratio,
+    )
+    k_head_num = k.size(1) if layout_k == "TND" else k.size(2)
+    if layout_q == "BSND":
+        out_shape = (q.size(0), q.size(1), k_head_num, topk)
+    else:
+        out_shape = (q.size(0), k_head_num, topk)
+    out = q.new_zeros(out_shape, dtype=torch.int32)
+    val = (
+        q.new_empty(out_shape, dtype=torch.float32)
+        if return_value
+        else q.new_empty((0,), dtype=torch.float32)
+    )
+    return out, val
+
+
+def _quant_lightning_indexer_v2_metadata_fake(
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_q: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    cmp_residual_k: torch.Tensor | None,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    topk: int,
+    quant_mode: int,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    layout_q: str,
+    layout_k: str,
+    mask_mode: int,
+    cmp_ratio: int,
+    device: str,
+) -> torch.Tensor:
+    del (
+        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k,
+        num_heads_q, num_heads_k, head_dim, topk, quant_mode,
+        batch_size, max_seqlen_q, max_seqlen_k, layout_q, layout_k,
+        mask_mode, cmp_ratio, device,
+    )
+    return torch.zeros((_DSA_METADATA_BUFFER_ELEMENTS,), dtype=torch.int32)
+
+register_fake("xllm_ops::quant_lightning_indexer_v2", _quant_lightning_indexer_v2_fake)
+register_fake(
+    "xllm_ops::quant_lightning_indexer_v2_metadata",
+    _quant_lightning_indexer_v2_metadata_fake,
+)

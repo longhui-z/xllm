@@ -44,6 +44,8 @@ from xllm.python.attention.dsa_attention import (
     _get_layer_cache_tensor,
     _scatter_by_slot,
 )
+from xllm.python import dsa_dump
+from xllm.python.platform import current_platform
 from xllm.python.layers.attention import Attention
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.layers.layernorm import RMSNorm
@@ -60,6 +62,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     record_layer_event,
 )
+from scripts.logger import logger
 
 try:
     from xllm.python import distributed
@@ -976,22 +979,78 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(
                     f"QLI {name} must be on {device}, got {tensor.device}"
                 )
-        # Use real quant_lightning_indexer.
-        # Ascend950PR kernel only compiles fp8 templates (DT_Q=36);
-        # C++ side does: int8 -> fp32 * dequant_scale -> fp8 (semantically correct).
-        # Kernel expects fp32 weights/scales per SupportInfo; convert from bf16/fp16.
-        query_quant_mode = 0  # dynamic_quant uses int8
-        key_quant_mode = 0
-        import sys
-        print(f"[QLI_PYTHON] calling quant_lightning_indexer: q_quant dtype={q_quant.dtype} shape={q_quant.shape}, index_cache dtype={index_cache.dtype} shape={index_cache.shape}", file=sys.stderr, flush=True)
-        topk, _ = torch.ops.xllm_ops.quant_lightning_indexer(
-            q_quant, index_cache, weights.to(torch.float32), q_scale.to(torch.float32), key_dequant_scale.to(torch.float32),
-            query_quant_mode, key_quant_mode,
-            query_seq_lens, key_seq_lens, block_table, qli_metadata,
-            "TND", "PA_BSND",
-            self.topk, 3,  # sparse_count, sparse_mode
-            2**63 - 1, 2**63 - 1, 4,  # pre_token, next_token, cmp_ratio
-            False,  # return_value
+        # Ascend950 uses the v2 int8-native indexer; every other SoC keeps the
+        # original v1 quant_lightning_indexer (which is the known-good path).
+        cmp_ratio = 4
+        use_v2 = current_platform.is_ascend950()
+        if use_v2:
+            # v2 kernel: actS2Orig = seqused_k * cmp_ratio + cmp_residual_k,
+            # then actS2Size = actS2Orig / cmp_ratio. Ceil up and leave zero
+            # residual so a partial decode block still maps to one entry.
+            seqused_q = query_seq_lens.to(torch.int32)
+            seqused_k = ((key_seq_lens + cmp_ratio - 1) // cmp_ratio).to(
+                torch.int32
+            )
+            cmp_residual_k = torch.zeros_like(seqused_k)
+            topk, _ = kernels.quant_lightning_indexer_v2(
+                q_quant,
+                index_cache,
+                weights.to(torch.float16),
+                q_scale,
+                key_dequant_scale,
+                query_seq_lens, key_seq_lens,  # cu_seqlens_q, cu_seqlens_k
+                seqused_q, seqused_k,  # seqused_q, seqused_k
+                cmp_residual_k,  # cmp_residual_k
+                block_table,  # block_table
+                None,  # output_idx_offset
+                qli_metadata,  # metadata
+                self.n_head, 1, self.head_dim,  # num_heads_q, num_heads_k, head_dim
+                self.topk, 2,  # topk, quant_mode (2=int8)
+                -1,  # max_seqlen_q (-1=auto)
+                "TND", "PA_BSND",  # layout_q, layout_k
+                3, cmp_ratio,  # mask_mode (3=rightDownCausal), cmp_ratio
+                0,  # return_value (0=no sparse_values)
+            )
+        else:
+            # Original v1 contract: int8 -> fp32 * dequant_scale -> fp8.
+            query_quant_mode = 0
+            key_quant_mode = 0
+            topk, _ = kernels.quant_lightning_indexer(
+                q_quant,
+                index_cache,
+                weights.to(torch.float32),
+                q_scale.to(torch.float32),
+                key_dequant_scale.to(torch.float32),
+                query_quant_mode,
+                key_quant_mode,
+                query_seq_lens,
+                key_seq_lens,
+                block_table,
+                qli_metadata,
+                "TND",
+                "PA_BSND",
+                self.topk,
+                3,  # sparse_mode
+                2**63 - 1, 2**63 - 1, 4,  # pre_token, next_token, cmp_ratio
+                False,  # return_value
+            )
+        dsa_dump.snap(
+            "quant_lightning_indexer",
+            {
+                "q_quant": q_quant,
+                "index_cache": index_cache,
+                "weights": weights,
+                "q_scale": q_scale,
+                "key_dequant_scale": key_dequant_scale,
+                "query_seq_lens": query_seq_lens,
+                "key_seq_lens": key_seq_lens,
+                "block_table": block_table,
+                "qli_metadata": qli_metadata,
+                "topk": topk,
+            },
+            layer=layer_id,
+            kind="moe" if layer_id else "dense",
+            extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
         )
         return topk
 
@@ -1560,10 +1619,19 @@ class DeepseekV4Model(nn.Module):
                 layer_cos_sin_cache,
                 input_ids,
             )
+            dsa_dump.snap(
+                "layer_output",
+                {"hidden": hidden, "residual": residual},
+                layer=layer_id,
+                kind="moe" if isinstance(layer.mlp, DeepseekV4MoE) else "dense",
+                extra={"compress_ratio": compress_ratio},
+            )
             record_layer_event(layer_id)
         # hc_head: merge the hc_mult streams back into a single hidden vector.
         merged = self._hc_head(residual if residual is not None else hidden)
         hidden = self.norm(merged, None)
+        dsa_dump.snap("final_hidden", {"hidden": hidden}, kind="dense")
+        dsa_dump.end_fwd()
         return hidden
 
 
