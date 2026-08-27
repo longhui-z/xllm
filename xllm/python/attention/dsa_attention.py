@@ -47,6 +47,9 @@ from xllm.python.attention.dsa_metadata import (
     build_cache_specs,
 )
 from xllm.python.model_executor.forward_context import get_forward_context
+from xllm.python.platform import current_platform
+from xllm.python import dsa_dump
+from scripts.logger import logger
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
@@ -185,6 +188,18 @@ class DsaAttentionBackend(AttentionBackend):
         self._move_metadata_to_device(dsa_metadata)
         self._build_precomputed_metadata(dsa_metadata, metadata)
         metadata.dsa_metadata = dsa_metadata
+        dsa_dump.start_fwd(
+            "prefill" if metadata.is_prefill else "decode",
+            max_layer=len(self._kv_caches) - 1 if self._kv_caches else -1,
+            ntokens=int(metadata.max_query_len),
+            meta={
+                "is_prefill": metadata.is_prefill,
+                "is_chunked_prefill": metadata.is_chunked_prefill,
+                "max_query_len": metadata.max_query_len,
+                "max_seq_len": metadata.max_seq_len,
+                "device": str(self.device),
+            },
+        )
 
     def select_dsa_layer_rope(
         self,
@@ -337,6 +352,17 @@ class DsaAttentionBackend(AttentionBackend):
                 compress_ratio,
             )
             _scatter_by_slot(cmp_kv, cmp_slot, compressed)
+            dsa_dump.snap(
+                "scatter_cmp_kv",
+                {
+                    "compressed": compressed,
+                    "cmp_kv": cmp_kv,
+                    "cmp_slot": cmp_slot,
+                    "cmp_block_table": cmp_block_table,
+                },
+                layer=layer_id,
+                kind="moe" if layer_id else "dense",
+            )
 
         # 3) Indexer: select top-k compressed blocks when ratio == 4.
         compress_topk_idxs: torch.Tensor | None = None
@@ -351,6 +377,10 @@ class DsaAttentionBackend(AttentionBackend):
                 mapping,
                 q,
             )
+            # DEBUG: clamp negative (invalid) indexer slots to the first valid
+            # compressed block to isolate SCFA handling of -1 top-k entries.
+            if compress_topk_idxs is not None:
+                compress_topk_idxs = compress_topk_idxs.clamp_min(0)
             if compress_topk_idxs is None:
                 raise RuntimeError("DSA indexer returned no top-k indices")
 
@@ -386,6 +416,7 @@ class DsaAttentionBackend(AttentionBackend):
             else None
         )
         out, _lse = _sparse_attn_sharedkv(
+            _dump_layer=layer,
             q=q,
             ori_kv=ori_kv_for_attn,
             cmp_kv=cmp_kv if compress_ratio > 1 else None,
@@ -611,26 +642,76 @@ class DsaAttentionBackend(AttentionBackend):
             seq_q[1:].clone() if seq_q.numel() > 1 else dsa.seq_lens_q
         )
         key_lens = dsa.seq_lens if dsa.seq_lens.numel() else seq_kv
-        dsa.precomputed_metadata_inputs += (query_lens, key_lens)
-        dsa.qli_metadata = kernels.quant_lightning_indexer_metadata(
-            num_heads_q=max(self.index_n_heads, 1),
-            num_heads_k=1,
-            head_dim=max(self.index_head_dim, 1),
-            query_quant_mode=0,
-            key_quant_mode=0,
-            actual_seq_lengths_query=query_lens,
-            actual_seq_lengths_key=key_lens,
-            batch_size=int(max(key_lens.size(0), 1)),
-            max_seqlen_q=max(max_q, 1),
-            max_seqlen_k=max(max_kv, 1),
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
-            pre_tokens=2**63 - 1,
-            next_tokens=2**63 - 1,
-            cmp_ratio=4,
-            device=str(self.device),
+        cmp_ratio = 4
+        use_v2 = current_platform.is_ascend950()
+        if use_v2:
+            # v2 metadata consumes the cumulative cu_seqlens_q (B+1) prefix; for
+            # the compressed-key layout (PA_BSND) seqused_k is the ceil block
+            # count and cmp_residual_k is the fractional remaining tokens,
+            # matching the kernel's actS2Orig = seqused_k * cmp_ratio +
+            # cmp_residual_k. Ceil guarantees a nonzero compressed block on a
+            # short prefill instead of an empty indexer.
+            key_lens_comp = key_lens.to(torch.int32)
+            cmp_residual_k = torch.zeros_like(key_lens_comp)
+            query_len_cumsum = (
+                seq_q if seq_q.numel() > 1 else dsa.kv_cu_seq_lens
+            )
+            dsa.precomputed_metadata_inputs += (
+                query_len_cumsum,
+                key_lens,
+                key_lens_comp,
+                cmp_residual_k,
+            )
+            dsa.qli_metadata = kernels.quant_lightning_indexer_v2_metadata(
+                cu_seqlens_q=query_len_cumsum,
+                cu_seqlens_k=None,
+                seqused_q=None,
+                seqused_k=key_lens_comp,
+                cmp_residual_k=cmp_residual_k,
+                num_heads_q=max(self.index_n_heads, 1),
+                num_heads_k=1,
+                head_dim=max(self.index_head_dim, 1),
+                topk=self.index_topk,
+                quant_mode=2,
+                batch_size=int(max(key_lens_comp.size(0), 1)),
+                max_seqlen_q=max(max_q, 1),
+                max_seqlen_k=max(max_kv, 1),
+                layout_q="TND",
+                layout_k="PA_BSND",
+                mask_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                cmp_ratio=cmp_ratio,
+                device=str(self.device),
+            )
+        else:
+            dsa.precomputed_metadata_inputs += (query_lens, key_lens)
+            dsa.qli_metadata = kernels.quant_lightning_indexer_metadata(
+                num_heads_q=max(self.index_n_heads, 1),
+                num_heads_k=1,
+                head_dim=max(self.index_head_dim, 1),
+                query_quant_mode=0,
+                key_quant_mode=0,
+                actual_seq_lengths_query=query_lens,
+                actual_seq_lengths_key=key_lens,
+                batch_size=int(max(key_lens.size(0), 1)),
+                max_seqlen_q=max(max_q, 1),
+                max_seqlen_k=max(max_kv, 1),
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=_MASK_MODE_RIGHT_DOWN_CAUSAL,
+                pre_tokens=2**63 - 1,
+                next_tokens=2**63 - 1,
+                cmp_ratio=cmp_ratio,
+                device=str(self.device),
+            )
+        dsa_dump.snap(
+            "quant_lightning_indexer_metadata",
+            {
+                "query_lens": query_lens,
+                "key_lens": key_lens,
+                "qli_metadata": dsa.qli_metadata,
+            },
+            extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
         )
 
     def _move_metadata_to_device(self, dsa: DsaMetadata) -> None:
@@ -812,25 +893,15 @@ def _scatter_by_slot(
         return
     valid = slots[:update_rows] >= 0
     if cache.device.type == "npu":
-        # Match C++ scatter_by_slot exactly. The dedicated NPU kernel preserves
-        # the cache's storage/layout semantics; Tensor.index_copy_ selects a
-        # different implementation and left the persistent SWA cache invalid
-        # for the first decode step.
-        from xllm.python import kernels
-
-        slots_slice = slots[:update_rows]
-        safe_slots = slots_slice.clamp_min(0)
-        valid_mask = slots_slice.ge(0).unsqueeze(1)
-        old_values = cache_2d.index_select(0, safe_slots)
-        safe_values = torch.where(
-            valid_mask,
-            value_2d[:update_rows].to(cache.dtype),
-            old_values,
-        )
-        kernels.scatter_nd_update(
-            cache_2d,
-            safe_slots.reshape(-1, 1),
-            safe_values,
+        # WORKAROUND: scatter_nd_update AICPU kernel fails with errorCode=0x2a
+        # on Ascend950. Fall back to index_copy_ which is a supported PyTorch
+        # native op.
+        if not valid.any():
+            return
+        cache_2d.index_copy_(
+            0,
+            slots[:update_rows][valid],
+            value_2d[:update_rows][valid].to(cache.dtype),
         )
         return
     if not valid.any():
@@ -844,6 +915,20 @@ def _scatter_by_slot(
 
 def _sparse_attn_sharedkv(**kwargs):
     """Thin indirection so the backend can be unit-tested without the kernel."""
-    from xllm.python import kernels
-
-    return kernels.sparse_attn_sharedkv(**kwargs)
+    layer = kwargs.pop("_dump_layer", None)
+    if layer is not None:
+        dsa_dump.snap(
+            "sparse_attn_sharedkv",
+            dict(kwargs),
+            layer=layer.layer_id,
+            kind="moe" if layer.layer_id else "dense",
+        )
+    out, lse = torch.ops.xllm_ops.sparse_attn_sharedkv(**kwargs)
+    if layer is not None:
+        dsa_dump.snap(
+            "sparse_attn_sharedkv_out",
+            {"out": out, "lse": lse},
+            layer=layer.layer_id,
+            kind="moe" if layer.layer_id else "dense",
+        )
+    return out, lse

@@ -44,6 +44,8 @@ from xllm.python.attention.dsa_attention import (
     _get_layer_cache_tensor,
     _scatter_by_slot,
 )
+from xllm.python import dsa_dump
+from xllm.python.platform import current_platform
 from xllm.python.layers.attention import Attention
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.layers.layernorm import RMSNorm
@@ -60,6 +62,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     record_layer_event,
 )
+from scripts.logger import logger
 
 try:
     from xllm.python import distributed
@@ -780,7 +783,7 @@ class DeepseekV4Attention(Attention):
             qr_pertoken_scale = getattr(backend, "_current_qr_pertoken_scale", None)
             hidden = getattr(backend, "_current_hidden", None)
             kv_hidden = getattr(backend, "_current_kv_hidden", hidden)
-            return self.indexer.select_qli_dsv4(
+            return self.indexer.select_qli(
                 layer_id,
                 layer_cache,
                 dsa,
@@ -846,7 +849,7 @@ class DeepseekV4Indexer(nn.Module):
     def process_weights_after_loading(self) -> None:
         self.wq_b.process_weights_after_loading()
 
-    def select_qli_dsv4(
+    def select_qli(
         self,
         layer_id,
         layer_cache,
@@ -957,6 +960,9 @@ class DeepseekV4Indexer(nn.Module):
             query_seq_lens = query_seq_lens[1:]
         key_seq_lens = dsa.actual_seq_lengths_kv
         qli_metadata = dsa.qli_metadata
+        # Ensure metadata is not null (kernel requires 1024 int32 elements).
+        if qli_metadata is None or qli_metadata.numel() == 0:
+            qli_metadata = torch.zeros(1024, dtype=torch.int32, device=device)
         # C++ packs the current forward's DSA metadata onto the runtime device
         # before building and invoking QLI. Python follows the same ownership
         # contract in DsaAttentionBackend.prepare_dsa_metadata_for_forward();
@@ -973,26 +979,76 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(
                     f"QLI {name} must be on {device}, got {tensor.device}"
                 )
-        topk, _ = kernels.quant_lightning_indexer(
-            query=q_quant,
-            key=index_cache,
-            weights=weights.to(torch.float16),
-            query_dequant_scale=q_scale,
-            key_dequant_scale=key_dequant_scale.to(torch.float16),
-            query_quant_mode=0,
-            key_quant_mode=0,
-            actual_seq_lengths_query=query_seq_lens,
-            actual_seq_lengths_key=key_seq_lens,
-            block_table=block_table,
-            metadata=qli_metadata,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.topk,
-            sparse_mode=3,
-            pre_tokens=2**63 - 1,
-            next_tokens=2**63 - 1,
-            cmp_ratio=4,
-            return_value=False,
+        # Ascend950 uses the v2 int8-native indexer; every other SoC keeps the
+        # original v1 quant_lightning_indexer (which is the known-good path).
+        cmp_ratio = 4
+        use_v2 = current_platform.is_ascend950()
+        if use_v2:
+            # v2 kernel: actS2Orig = seqused_k * cmp_ratio + cmp_residual_k,
+            # then actS2Size = actS2Orig / cmp_ratio. seqused_k is ceil block
+            # count (at least 1 for a nonzero key) and cmp_residual_k is the
+            # fractional remaining tokens, so a short 1-token prefill still
+            # yields a usable compressed block instead of an empty kernel.
+            seqused_q = query_seq_lens.to(torch.int32)
+            seqused_k = key_seq_lens.to(torch.int32)
+            cmp_residual_k = torch.zeros_like(seqused_k)
+            topk, _ = kernels.quant_lightning_indexer_v2(
+                q_quant,
+                index_cache,
+                weights.to(torch.float16),
+                q_scale,
+                key_dequant_scale,
+                query_seq_lens, key_seq_lens,  # cu_seqlens_q, cu_seqlens_k
+                seqused_q, seqused_k,  # seqused_q, seqused_k
+                cmp_residual_k,  # cmp_residual_k
+                block_table,  # block_table
+                None,  # output_idx_offset
+                qli_metadata,  # metadata
+                self.n_head, 1, self.head_dim,  # num_heads_q, num_heads_k, head_dim
+                self.topk, 2,  # topk, quant_mode (2=int8)
+                -1,  # max_seqlen_q (-1=auto)
+                "TND", "PA_BSND",  # layout_q, layout_k
+                3, cmp_ratio,  # mask_mode (3=rightDownCausal), cmp_ratio
+                0,  # return_value (0=no sparse_values)
+            )
+        else:
+            # Original v1 path, unchanged from the known-good baseline.
+            topk, _ = kernels.quant_lightning_indexer(
+                q_quant,
+                index_cache,
+                weights.to(torch.float16),
+                q_scale,
+                key_dequant_scale.to(torch.float16),
+                0,
+                0,
+                query_seq_lens,
+                key_seq_lens,
+                block_table,
+                qli_metadata,
+                "TND",
+                "PA_BSND",
+                self.topk,
+                3,
+                2**63 - 1, 2**63 - 1, 4,
+                False,
+            )
+        dsa_dump.snap(
+            "quant_lightning_indexer",
+            {
+                "q_quant": q_quant,
+                "index_cache": index_cache,
+                "weights": weights,
+                "q_scale": q_scale,
+                "key_dequant_scale": key_dequant_scale,
+                "query_seq_lens": query_seq_lens,
+                "key_seq_lens": key_seq_lens,
+                "block_table": block_table,
+                "qli_metadata": qli_metadata,
+                "topk": topk,
+            },
+            layer=layer_id,
+            kind="moe" if layer_id else "dense",
+            extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
         )
         return topk
 
@@ -1373,16 +1429,37 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Match DeepseekV4DecoderLayerImpl::forward exactly: HyperConnection
         # selects the 2D sub-input first, then RMSNorm is applied to that input.
         residual_attn = hidden
+        dsa_dump.snap(
+            "decoder_input", {"hidden": hidden}, layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
+        )
         attn_input, post_attn, comb_attn = self.hc.hc_pre(
             hidden,
             self.hc.hc_attn_fn,
             self.hc.hc_attn_scale,
             self.hc.hc_attn_base,
         )
+        dsa_dump.snap(
+            "hc_pre_attn", {"attn_input": attn_input, "post": post_attn, "comb": comb_attn},
+            layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
+        )
         attn_input = self.input_layernorm(attn_input)
+        dsa_dump.snap(
+            "input_layernorm_out", {"attn_input": attn_input}, layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
+        )
         attn_output = self.self_attn(attn_input, positions, cos_sin_cache)
+        dsa_dump.snap(
+            "attn_output", {"attn_output": attn_output}, layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
+        )
         hidden = self.hc.hc_post(
             attn_output, residual_attn, post_attn, comb_attn
+        )
+        dsa_dump.snap(
+            "hc_post_attn", {"hidden": hidden}, layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
         )
 
         residual_ffn = hidden
@@ -1392,11 +1469,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc.hc_ffn_scale,
             self.hc.hc_ffn_base,
         )
+        dsa_dump.snap(
+            "hc_pre_ffn", {"ffn_input": ffn_input, "post": post_ffn, "comb": comb_ffn},
+            layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
+        )
         ffn_input = self.post_attention_layernorm(ffn_input)
+        dsa_dump.snap(
+            "post_attention_layernorm_out", {"ffn_input": ffn_input}, layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
+        )
         ffn_output = (
             self.mlp(ffn_input, input_ids)
             if isinstance(self.mlp, DeepseekV4MoE)
             else self.mlp(ffn_input)
+        )
+        dsa_dump.snap(
+            "mlp_output", {"ffn_output": ffn_output}, layer=self.layer_id,
+            kind="moe" if isinstance(self.mlp, DeepseekV4MoE) else "dense",
         )
         hidden = self.hc.hc_post(
             ffn_output, residual_ffn, post_ffn, comb_ffn
@@ -1561,10 +1651,19 @@ class DeepseekV4Model(nn.Module):
                 layer_cos_sin_cache,
                 input_ids,
             )
+            dsa_dump.snap(
+                "layer_output",
+                {"hidden": hidden, "residual": residual},
+                layer=layer_id,
+                kind="moe" if isinstance(layer.mlp, DeepseekV4MoE) else "dense",
+                extra={"compress_ratio": compress_ratio},
+            )
             record_layer_event(layer_id)
         # hc_head: merge the hc_mult streams back into a single hidden vector.
         merged = self._hc_head(residual if residual is not None else hidden)
         hidden = self.norm(merged, None)
+        dsa_dump.snap("final_hidden", {"hidden": hidden}, kind="dense")
+        dsa_dump.end_fwd()
         return hidden
 
 

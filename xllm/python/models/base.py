@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch.nn as nn
 
+from scripts.logger import logger
+
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
 
@@ -60,7 +62,14 @@ class PyModelBase(nn.Module):
     ) -> torch.Tensor:
         if selected_idxes is not None and selected_idxes.numel() > 0:
             hidden = hidden.index_select(0, selected_idxes)
-        return self.lm_head(hidden)
+        logits = self.lm_head(hidden)
+        try:
+            from xllm.python import dsa_dump
+
+            dsa_dump.snap("logits", {"hidden": hidden, "logits": logits})
+        except Exception:
+            pass
+        return logits
 
     # -- weight loading -------------------------------------------------------
     def load_weights(

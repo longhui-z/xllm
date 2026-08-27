@@ -140,7 +140,7 @@ def _npu_chip_from_smi() -> Optional[str]:
     except (OSError, subprocess.SubprocessError):
         return None
 
-    match = re.search(r"910[A-Za-z0-9]*", completed.stdout)
+    match = re.search(r"(?:910|950)[A-Za-z0-9_\-]*", completed.stdout)
     if match is None:
         return None
     return match.group(0).lower()
@@ -163,7 +163,7 @@ def _npu_chip_from_acl() -> Optional[str]:
         return None
     if not soc_name:
         return None
-    match = re.search(r"910[A-Za-z0-9]*", soc_name)
+    match = re.search(r"(?:910|950)[A-Za-z0-9_\-]*", soc_name)
     if match is None:
         return None
     return match.group(0).lower()
@@ -253,6 +253,17 @@ class Platform:
         if chip is not None:
             return chip
         return "unknown"
+
+    @classmethod
+    @functools.lru_cache(maxsize=1)
+    def is_ascend950(cls) -> bool:
+        """True when the NPU chip is an Ascend 950 family part.
+
+        Chip names include ``950PR`` / ``950Z``; only NPU chips whose name
+        starts with ``950`` qualify. Falls back to False when the chip cannot
+        be determined.
+        """
+        return cls.get_npu_chip().startswith("950")
 
     @classmethod
     @functools.lru_cache(maxsize=1)
