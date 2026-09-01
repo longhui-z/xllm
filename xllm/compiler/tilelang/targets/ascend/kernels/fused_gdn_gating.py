@@ -224,19 +224,17 @@ def build_fused_gdn_gating_kernel(
                 T.tile.exp(A_log_ub, A_log_ub)
                 T.tile.mul(A_log_ub, A_log_ub, -1.0)
 
-                dt_bias_base_ub = T.alloc_shared(
-                    (1, ub_tensor_dim), acc_dtype
-                )
-                T.copy(dt_bias[0], dt_bias_base_ub[0, :num_heads])
+                T.copy(dt_bias[0], dt_bias_ub[0, :num_heads])
                 for r in T.serial(rows_per_iter):
                     T.copy(
                         A_log_ub[0, :ub_tensor_dim],
                         neg_exp_A_ub[r, :ub_tensor_dim],
                     )
-                    T.copy(
-                        dt_bias_base_ub[0, :ub_tensor_dim],
-                        dt_bias_ub[r, :ub_tensor_dim],
-                    )
+                    if r > 0:
+                        T.copy(
+                            dt_bias_ub[0, :ub_tensor_dim],
+                            dt_bias_ub[r, :ub_tensor_dim],
+                        )
 
                 if use_bulk_dma:
                     for chunk_idx in T.serial(num_chunks):
@@ -307,9 +305,7 @@ def build_fused_gdn_gating_kernel(
                         T.tile.cast(
                             x_ub, b_half_ub, "CAST_NONE", multi_count
                         )
-                        T.tile.sigmoid(
-                            beta_fp32_ub, x_ub
-                        )
+                        T.tile.sigmoid(beta_fp32_ub, x_ub)
                         T.tile.mul(x_ub, neg_exp_A_ub, beta_x_ub)
                         T.tile.cast(
                             b_half_ub,
@@ -404,9 +400,7 @@ def build_fused_gdn_gating_kernel(
                         T.tile.cast(
                             x_ub, b_half_ub, "CAST_NONE", multi_count
                         )
-                        T.tile.sigmoid(
-                            beta_fp32_ub, x_ub
-                        )
+                        T.tile.sigmoid(beta_fp32_ub, x_ub)
                         T.tile.mul(x_ub, neg_exp_A_ub, beta_x_ub)
                         T.tile.cast(
                             b_half_ub,
@@ -427,6 +421,10 @@ def build_fused_gdn_gating_kernel(
                         with T.If(chunk_idx < num_chunks - 1):
                             with T.Then():
                                 mte3_notify_mte2(CHUNK_OUTPUT_STORED_EVENT)
+
+                # Keep the preamble buffer live so TileLang does not alias it
+                # with the BF16 input buffer under CANN 9.
+                T.tile.mul(A_log_ub, A_log_ub, 1.0)
 
     return fused_gdn_gating_kernel
 

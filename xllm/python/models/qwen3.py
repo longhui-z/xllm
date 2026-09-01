@@ -42,8 +42,10 @@ from xllm.python.layers import (
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     record_layer_event,
 )  # noqa: F401
+from xllm.python.model_executor.cp_utils import cp_merge_rows, cp_shard_positions, cp_shard_rows
 from xllm.python.models.base import PyModelBase
 
 
@@ -64,6 +66,8 @@ class Qwen3Config:
     attention_bias: bool = False
     tp_size: int = 1
     tp_rank: int = 0
+    dp_size: int = 1
+    dp_rank: int = 0
 
     @classmethod
     def from_dict(cls, d: dict) -> "Qwen3Config":
@@ -93,6 +97,8 @@ class Qwen3Config:
             attention_bias=bool(pick("attention_bias", default=False)),
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
+            dp_size=int(pick("dp_size", default=1)),
+            dp_rank=int(pick("dp_rank", default=0)),
         )
 
     def head_split(self) -> Tuple[int, int, int]:
@@ -169,23 +175,57 @@ class Qwen3Attention(nn.Module):
         cos_sin_cache: torch.Tensor,
         cos: torch.Tensor | None,
         sin: torch.Tensor | None,
+        mrope_section: Optional[List[int]] = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden)
 
-        q, k, v = kernels.fused_qk_norm_rope(
-            qkv,
-            num_heads_q=self.num_heads,
-            num_heads_k=self.num_kv_heads,
-            num_heads_v=self.num_kv_heads,
-            head_dim=self.head_dim,
-            eps=self.q_norm.eps,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
-            cos_sin_cache=cos_sin_cache,
-            position_ids=positions,
-            cos=cos,
-            sin=sin,
-        )
+        if mrope_section is not None and positions.dim() == 2:
+            # mRoPE prefill: per-head Q/K RMSNorm (same math as the fused
+            # kernel) then kernels.mrope, which does the time/height/width
+            # section combination + rotation in one op.
+            # cos_sin_cache here is the [max_pos, head_dim]=[cos_half|sin_half]
+            # table; q/k stay 2D [N, num_heads*head_dim] as npu_mrope requires.
+            num_tokens = qkv.size(0)
+            q = torch.ops.xllm_ops.rms_norm(
+                qkv[:, : self.q_size].reshape(
+                    num_tokens * self.num_heads, self.head_dim
+                ),
+                self.q_norm.weight,
+                self.q_norm.eps,
+            ).view(num_tokens, self.q_size)
+            k = torch.ops.xllm_ops.rms_norm(
+                qkv[:, self.q_size : self.q_size + self.kv_size].reshape(
+                    num_tokens * self.num_kv_heads, self.head_dim
+                ),
+                self.k_norm.weight,
+                self.k_norm.eps,
+            ).view(num_tokens, self.kv_size)
+            v = qkv[:, self.q_size + self.kv_size :]
+            q, k = kernels.mrope(
+                positions,
+                q,
+                k,
+                cos_sin_cache,
+                self.head_dim,
+                mrope_section=list(mrope_section),
+                rotary_mode="half",
+                cache_mode="interleave",
+            )
+        else:
+            q, k, v = kernels.fused_qk_norm_rope(
+                qkv,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_kv_heads,
+                num_heads_v=self.num_kv_heads,
+                head_dim=self.head_dim,
+                eps=self.q_norm.eps,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=cos_sin_cache,
+                position_ids=positions,
+                cos=cos,
+                sin=sin,
+            )
 
         attn_out = self.attn(q, k, v)
         return self.o_proj(attn_out)
@@ -224,6 +264,7 @@ class Qwen3DecoderLayer(nn.Module):
         cos_sin_cache: torch.Tensor,
         cos: torch.Tensor | None,
         sin: torch.Tensor | None,
+        mrope_section: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden
@@ -232,7 +273,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden, residual = self.input_layernorm(hidden, residual)
 
         hidden = self.self_attn(
-            positions, hidden, cos_sin_cache, cos, sin
+            positions, hidden, cos_sin_cache, cos, sin, mrope_section
         )
 
         hidden, residual = self.post_attention_layernorm(hidden, residual)
@@ -271,6 +312,7 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        mrope_section: Optional[List[int]] = None,
     ) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
         # The fused QK-norm+RoPE kernel requires int64 position ids, but C++
@@ -279,13 +321,28 @@ class Qwen3Model(nn.Module):
         # (its output lives in the graph memory pool), so replay re-casts the
         # updated static_positions correctly.
         positions = positions.to(torch.int64).contiguous()
+        # Context-Parallel: shard the sequence across the CP group after embed
+        # and merge back before the final norm (model-side CP semantics). Only
+        # active on prefill with cp_size>1; cp_context is None otherwise.
+        cp_context = get_forward_context().cp_context
+        if cp_context is not None:
+            hidden = cp_shard_rows(hidden, cp_context)
+            positions = cp_shard_positions(positions, cp_context).contiguous()
         residual: Optional[torch.Tensor] = None
         for i, layer in enumerate(self.layers):
             hidden, residual = layer(
-                hidden, residual, positions, self.rotary.cos_sin_cache, None, None
+                hidden,
+                residual,
+                positions,
+                self.rotary.cos_sin_cache,
+                None,
+                None,
+                mrope_section,
             )
             record_layer_event(i)
         hidden, _ = self.norm(hidden, residual)
+        if cp_context is not None:
+            hidden = cp_merge_rows(hidden, cp_context)
         return hidden
 
 
@@ -301,6 +358,11 @@ class Qwen3ForCausalLM(PyModelBase):
         self.device = device
 
         tp = self.cfg.tp_size
+        dp = self.cfg.dp_size
+        if tp * dp != int(config.get("world_size", tp * dp)):
+            raise ValueError("world_size must equal tp_size * dp_size")
+        if not 0 <= self.cfg.dp_rank < dp:
+            raise ValueError("dp_rank must be in [0, dp_size)")
         assert self.cfg.vocab_size % tp == 0
         self.model = Qwen3Model(self.cfg, dtype, device)
         self.lm_head = ColumnParallelLinear(

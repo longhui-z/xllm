@@ -15,13 +15,11 @@ limitations under the License.
 
 #include "device.h"
 
-#include "core/framework/config/model_config.h"
 #include "core/platform/platform.h"
 #if defined(USE_NPU)
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
 #include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
 #include <torch_npu/csrc/core/npu/NPUFunctions.h>
-#include <torch_npu/csrc/libs/init_npu.h>
 #elif defined(USE_MLU)
 #include <cn_api.h>
 #include <framework/core/caching_allocator.h>
@@ -97,14 +95,7 @@ int32_t Device::index() const { return device_.index(); }
 // set device before init device context
 void Device::init_device_context() const {
 #if defined(USE_NPU)
-  if (ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl())) {
-    // Python path: full NPU runtime already initialized in main() via
-    // aclInit + torch_npu._C._npu_init(). Only switch device here.
-    c10_npu::SetDevice(index());
-  } else {
-    torch_npu::init_npu(index());
-  }
+  c10_npu::set_device(index());
 #endif
 }
 

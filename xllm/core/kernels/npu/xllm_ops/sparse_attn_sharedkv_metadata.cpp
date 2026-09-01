@@ -22,12 +22,10 @@ namespace xllm::kernel::npu {
 
 namespace {
 
+// 未提供的 optional tensor 保持空 optional，交给 aclnn 框架按 null 处理，
+// 而不是用一个空 buffer 的 tensor 兜底（aclnn 会因 buffer==nullptr 报错）。
 auto get_valid_tensor = [](const c10::optional<at::Tensor>& tensor_opt,
-                           at::Device device) {
-  return tensor_opt.has_value()
-             ? tensor_opt
-             : torch::empty({0}, torch::dtype(torch::kInt32).device(device));
-};
+                           at::Device device) { return tensor_opt; };
 
 }  // namespace
 

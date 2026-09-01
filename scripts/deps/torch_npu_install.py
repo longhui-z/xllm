@@ -39,6 +39,7 @@ _LOCAL_WHEEL_NAMES = {
 }
 
 REQUIRED_VERSION = "2.9.0.post2+gita5f47a6"
+USE_INSTALLED_ENV = "XLLM_USE_INSTALLED_TORCH_NPU"
 
 
 def _get_cann_version() -> str:
@@ -102,6 +103,17 @@ def _download_and_install(wheel_url: str) -> None:
 def ensure_torch_npu_ready() -> None:
     """Ensure torch_npu matches REQUIRED_VERSION; install or upgrade if not."""
     installed = _installed_version()
+    if os.environ.get(USE_INSTALLED_ENV) == "1":
+        if installed is None:
+            raise RuntimeError(
+                f"{USE_INSTALLED_ENV}=1 requires torch_npu to be installed"
+            )
+        logger.info(
+            f"Using externally managed torch_npu {installed} "
+            f"because {USE_INSTALLED_ENV}=1."
+        )
+        return
+
     if installed is not None and REQUIRED_VERSION in installed:
         logger.info(f"torch_npu {installed} is ready.")
         return

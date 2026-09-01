@@ -12,6 +12,14 @@ add_compile_definitions(YLT_ENABLE_IBV)
 add_definitions(-DYLT_ENABLE_IBV)
 set(YLT_ENABLE_IBV ON)
 
+if(USE_NPU)
+  # The tilelang-generated static kernel archive may emit duplicate global
+  # symbols (e.g. g_tilingKey__w4) across kernel variants. Allow the linker to
+  # take the first definition and suppress the multiple-definition error for
+  # all link targets (xllm, spawn_worker, export_module, ...).
+  add_link_options(-Wl,--allow-multiple-definition)
+endif()
+
 if(DEVICE_ARCH STREQUAL "ARM")
     set(CMAKE_SYSTEM_PROCESSOR aarch64)
     set(RUST_TARGET aarch64-unknown-linux-gnu)
@@ -497,16 +505,14 @@ if(USE_NPU)
       $ENV{ATB_HOME_PATH}/include
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/torch_npu_ops/
   )
-  ## Adapt to the modification in DeekSeekV4 where the installation path of xllm_ops has been changed to custom_xllm_math
-  if(EXISTS "$ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include")
-    include_directories(SYSTEM
-      $ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include/
-    )
-  endif()
-
+  ## Prefer the current xllm_ops package over a stale legacy vendor install.
   if(EXISTS "$ENV{NPU_HOME_PATH}/opp/vendors/custom_xllm_math/op_api/include/aclnnop")
     include_directories(SYSTEM
         $ENV{NPU_HOME_PATH}/opp/vendors/custom_xllm_math/op_api/include/aclnnop
+    )
+  elseif(EXISTS "$ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include")
+    include_directories(SYSTEM
+      $ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include/
     )
   endif()
 

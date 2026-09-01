@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import importlib
 import multiprocessing
 import os
+import re
 from pathlib import Path
 
 from ...common.cache import compute_cache_key, is_cache_hit
@@ -30,6 +31,7 @@ _DEFAULT_TILELANG_JOB_LIMITS = (
     (64, 8),
 )
 _DEFAULT_TILELANG_JOBS_FOR_LARGE_HOST = 16
+_CANN_SIGMOID_INTERNAL_WORKSPACE_MAJOR_VERSION = 9
 
 
 def default_tilelang_jobs(cpu_count: int | None = None) -> int:
@@ -89,6 +91,177 @@ def _write_text_if_changed(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+_CANN_VERSION_PATTERN = re.compile(r'#define CANN_VERSION_STR "([0-9]+)')
+_FLOAT_TENSOR_PATTERN = re.compile(
+    r"auto\s+(?P<name>[A-Za-z_]\w*)\s*=.*GetWithOffset<float>"
+)
+_SIGMOID_CALL_PATTERN = re.compile(
+    r"AscendC::Sigmoid\((?P<dst>[^,\n]+),\s*"
+    r"(?P<src>[^,\n]+),\s*(?P<tmp>[A-Za-z_]\w*)\[[^\]]+\],\s*"
+    r"(?P<count>\d+)\);"
+)
+_LOCAL_TENSOR_DECL_PATTERN = re.compile(
+    r"auto\s+(?P<name>[A-Za-z_]\w*)\s*=.*GetWithOffset<(?P<dtype>[^>]+)>"
+)
+_LOCAL_TENSOR_REF_PATTERN = re.compile(
+    r"(?P<name>[A-Za-z_]\w*)\[(?P<offset>[^\]]+)\]"
+)
+
+
+def _adapt_cann9_sigmoid_source(source: str, include_dirs: tuple[str, ...]) -> str:
+    """Uses CANN 9's internal Sigmoid workspace when TileLang emits a float one."""
+    if not include_dirs:
+        return source
+    version_header = Path(include_dirs[0]) / "version" / "cann_version.h"
+    try:
+        version_text = version_header.read_text(encoding="utf-8")
+    except OSError:
+        return source
+    version_match = _CANN_VERSION_PATTERN.search(version_text)
+    if (
+        version_match is None
+        or int(version_match.group(1))
+        < _CANN_SIGMOID_INTERNAL_WORKSPACE_MAJOR_VERSION
+    ):
+        return source
+
+    float_tensors = {
+        match.group("name") for match in _FLOAT_TENSOR_PATTERN.finditer(source)
+    }
+
+    def replace_float_workspace(match: re.Match[str]) -> str:
+        if match.group("tmp") not in float_tensors:
+            return match.group(0)
+        return (
+            f"AscendC::Sigmoid({match.group('dst')}, {match.group('src')}, "
+            f"{match.group('count')});"
+        )
+
+    return _SIGMOID_CALL_PATTERN.sub(replace_float_workspace, source)
+
+
+def _reinterpret_local_tensor(
+    expression: str, expected_dtype: str, tensor_dtypes: dict[str, str]
+) -> str:
+    match = _LOCAL_TENSOR_REF_PATTERN.fullmatch(expression.strip())
+    if match is None:
+        return expression
+    name = match.group("name")
+    if tensor_dtypes.get(name) == expected_dtype:
+        return expression
+    if name not in tensor_dtypes:
+        return expression
+    return (
+        f"{name}.ReinterpretCast<{expected_dtype}>()"
+        f"[{match.group('offset')}]"
+    )
+
+
+def _adapt_cross_dtype_local_tensor_aliases(source: str) -> str:
+    """Repairs cross-dtype UB aliases emitted by TileLang 3.2 memory planning."""
+    tensor_dtypes = {
+        match.group("name"): match.group("dtype")
+        for match in _LOCAL_TENSOR_DECL_PATTERN.finditer(source)
+    }
+
+    copy_gm_pattern = re.compile(
+        r"(?P<prefix>tl::ascend::copy_gm_to_ub<(?P<dtype>[^,>]+)[^>]*>\()"
+        r"(?P<dst>[A-Za-z_]\w*\[[^\]]+\])"
+    )
+    copy_ub_to_gm_pattern = re.compile(
+        r"(?P<prefix>tl::ascend::copy_ub_to_gm<(?P<dtype>[^,>]+)[^>]*>\("
+        r"[^,]+,\s*)(?P<src>[A-Za-z_]\w*\[[^\]]+\])"
+    )
+    copy_ub_pattern = re.compile(
+        r"(?P<prefix>tl::ascend::copy_ub_to_ub<(?P<dst_dtype>[^,>]+),\s*"
+        r"(?P<src_dtype>[^,>]+)[^>]*>\()"
+        r"(?P<dst>[A-Za-z_]\w*\[[^\]]+\]),\s*"
+        r"(?P<src>[A-Za-z_]\w*\[[^\]]+\])"
+    )
+    broadcast_pattern = re.compile(
+        r"(?P<prefix>tl::ascend::Broadcast<(?P<dtype>[^,>]+)[^>]*>\()"
+        r"(?P<dst>[A-Za-z_]\w*\[[^\]]+\]),\s*"
+        r"(?P<src>[A-Za-z_]\w*\[[^\]]+\])"
+    )
+    gather_pattern = re.compile(
+        r"(?P<prefix>AscendC::Gather\()"
+        r"(?P<dst>[A-Za-z_]\w*\[[^\]]+\]),\s*"
+        r"(?P<src>[A-Za-z_]\w*\[[^\]]+\])"
+    )
+    mul_pattern = re.compile(
+        r"(?P<prefix>AscendC::Mul\()"
+        r"(?P<dst>[A-Za-z_]\w*\[[^\]]+\]),\s*"
+        r"(?P<src0>[A-Za-z_]\w*\[[^\]]+\]),\s*"
+        r"(?P<src1>[A-Za-z_]\w*\[[^\]]+\])"
+    )
+
+    def replace_copy_gm(match: re.Match[str]) -> str:
+        return match.group("prefix") + _reinterpret_local_tensor(
+            match.group("dst"), match.group("dtype"), tensor_dtypes
+        )
+
+    def replace_copy_ub_to_gm(match: re.Match[str]) -> str:
+        return match.group("prefix") + _reinterpret_local_tensor(
+            match.group("src"), match.group("dtype"), tensor_dtypes
+        )
+
+    def replace_copy_ub(match: re.Match[str]) -> str:
+        dst = _reinterpret_local_tensor(
+            match.group("dst"), match.group("dst_dtype"), tensor_dtypes
+        )
+        src = _reinterpret_local_tensor(
+            match.group("src"), match.group("src_dtype"), tensor_dtypes
+        )
+        return f"{match.group('prefix')}{dst}, {src}"
+
+    def replace_broadcast(match: re.Match[str]) -> str:
+        dtype = match.group("dtype")
+        dst = _reinterpret_local_tensor(match.group("dst"), dtype, tensor_dtypes)
+        src = _reinterpret_local_tensor(match.group("src"), dtype, tensor_dtypes)
+        return f"{match.group('prefix')}{dst}, {src}"
+
+    def replace_gather(match: re.Match[str]) -> str:
+        src_match = _LOCAL_TENSOR_REF_PATTERN.fullmatch(match.group("src"))
+        if src_match is None:
+            return match.group(0)
+        dtype = tensor_dtypes.get(src_match.group("name"))
+        if dtype is None:
+            return match.group(0)
+        dst = _reinterpret_local_tensor(match.group("dst"), dtype, tensor_dtypes)
+        return f"{match.group('prefix')}{dst}, {match.group('src')}"
+
+    def replace_mul(match: re.Match[str]) -> str:
+        expressions = [
+            match.group("dst"),
+            match.group("src0"),
+            match.group("src1"),
+        ]
+        dtypes = []
+        for expression in expressions:
+            tensor_match = _LOCAL_TENSOR_REF_PATTERN.fullmatch(expression)
+            if tensor_match is None:
+                return match.group(0)
+            dtypes.append(tensor_dtypes.get(tensor_match.group("name")))
+        expected_dtype = next(
+            (dtype for dtype in dtypes if dtype is not None and dtypes.count(dtype) >= 2),
+            None,
+        )
+        if expected_dtype is None:
+            return match.group(0)
+        adapted = [
+            _reinterpret_local_tensor(expression, expected_dtype, tensor_dtypes)
+            for expression in expressions
+        ]
+        return f"{match.group('prefix')}{', '.join(adapted)}"
+
+    source = copy_gm_pattern.sub(replace_copy_gm, source)
+    source = copy_ub_to_gm_pattern.sub(replace_copy_ub_to_gm, source)
+    source = copy_ub_pattern.sub(replace_copy_ub, source)
+    source = broadcast_pattern.sub(replace_broadcast, source)
+    source = gather_pattern.sub(replace_gather, source)
+    return mul_pattern.sub(replace_mul, source)
+
+
 def _run_variant_worker(args: _VariantWorkerArgs) -> _VariantBuildResult:
     mod = importlib.import_module(args.kernel_cls_module)
     kernel_cls = getattr(mod, args.kernel_cls_name)
@@ -104,6 +277,8 @@ def _run_variant_worker(args: _VariantWorkerArgs) -> _VariantBuildResult:
         ),
         compile_spec.variant_key,
     )
+    rendered_source = _adapt_cann9_sigmoid_source(rendered_source, args.include_dirs)
+    rendered_source = _adapt_cross_dtype_local_tensor_aliases(rendered_source)
     kernel_abi = abi_entry.parse_kernel_abi(rendered_source, args.entry_symbol)
     plan.generated_source.write_text(rendered_source, encoding="utf-8")
 

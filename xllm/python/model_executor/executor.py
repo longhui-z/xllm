@@ -42,7 +42,26 @@ def _create_attention_backend(
     first_attention: Attention,
     device: torch.device,
     dtype: torch.dtype,
+    config: dict | None = None,
 ) -> AttentionBackend:
+    config = config or {}
+    model_type = config.get("model_type", "")
+    if model_type == "deepseek_v4" and current_platform.is_npu():
+        from xllm.python.attention.dsa_attention import DsaAttentionBackend
+
+        return DsaAttentionBackend(
+            compress_ratios=list(config.get("compress_ratios", [])),
+            window_size=int(config.get("window_size", 128)),
+            n_layers=int(config.get("n_layers", config.get("num_hidden_layers", 0))),
+            num_heads=first_attention.num_heads,
+            attn_head_dim=first_attention.head_dim,
+            index_topk=int(config.get("index_topk", 512)),
+            index_n_heads=int(config.get("index_n_heads", 64)),
+            index_head_dim=int(config.get("index_head_dim", 128)),
+            rope_head_dim=int(config.get("qk_rope_head_dim", 64)),
+            device=device,
+            dtype=dtype,
+        )
     if current_platform.is_npu():
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
@@ -101,11 +120,15 @@ class ModelExecutor:
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
         self.attention_backend = _create_attention_backend(
-            first_attention, device, first_parameter.dtype
+            first_attention, device, first_parameter.dtype, config
         )
 
         execution_model = model.model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
+        # Context-Parallel: shard prefill sequences across the CP group. Decode
+        # stays on the non-CP path (CP is prefill-only, eager-only in v1).
+        self.eager_runner.cp_size = int(config.get("cp_size", 1))
+        self.eager_runner.cp_rank = int(config.get("cp_rank", 0))
         self.decode_graph_runner = None
         self.inductor_runner = None
 
@@ -118,9 +141,11 @@ class ModelExecutor:
             "none",
             "0",
             "cudagraphs",
+            "aclgraph",
         ):
             raise NotImplementedError(
-                "Python data parallel graph execution supports cudagraphs only"
+                "Python data parallel graph execution supports cudagraphs and "
+                "aclgraph only"
             )
         if graph_backend in ("", "off", "none", "0"):
             pass
@@ -147,8 +172,20 @@ class ModelExecutor:
                 device,
                 max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
+                dp_size,
+                dp_rank,
             )
         else:
+            if self.eager_runner.cp_size > 1:
+                # CP is prefill-only and lives on eager_runner; a compile
+                # backend serves prefill through InductorRunner, which carries
+                # no cp_context, so CP would silently no-op. Reject rather than
+                # run without the requested sharding.
+                raise NotImplementedError(
+                    "Context-Parallel (cp_size > 1) is not supported with the "
+                    f"'{graph_backend}' graph backend; CP is eager-only. Use "
+                    "graph_backend=off/aclgraph, or set cp_size=1."
+                )
             from xllm.python.model_executor.runners.inductor import InductorRunner
             self.inductor_runner = InductorRunner(
                 execution_model, self.attention_backend, device, graph_backend

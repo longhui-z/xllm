@@ -37,6 +37,7 @@ from .activation import silu_and_mul
 from .attention import (
     reshape_paged_cache,
     update_decode_graph_metadata,
+    vision_fusion_attention,
 )
 from .causal_conv1d import (
     causal_conv1d_decode,
@@ -53,6 +54,7 @@ from .moe import (
     cutlass_fused_moe,
     fused_moe,
     grouped_moe,
+    grouped_moe_with_selected_experts,
     moe_fused_topk,
     prepare_grouped_moe_weights,
     supports_cutlass_moe,
@@ -71,6 +73,8 @@ from .quantization import (
 from .rotary_embedding import (
     fused_qk_norm_rope,
     interleaved_rotary_embedding,
+    mrope,
+    vision_rotary_mul,
 )
 from .sparse_attention import (
     lightning_indexer,
@@ -88,12 +92,16 @@ __all__ = [
     "silu_and_mul",
     "reshape_paged_cache",
     "update_decode_graph_metadata",
+    "vision_fusion_attention",
     "fused_qk_norm_rope",
     "interleaved_rotary_embedding",
+    "mrope",
+    "vision_rotary_mul",
     "moe_fused_topk",
     "cutlass_fused_moe",
     "fused_moe",
     "grouped_moe",
+    "grouped_moe_with_selected_experts",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",

@@ -198,3 +198,9 @@ target_link_libraries(tilelang_kernels
     m
     dl
 )
+
+# The tilelang-generated kernel objects may emit tentative definitions of the
+# same tiling-key symbol (e.g. g_tilingKey__w4) from multiple kernel variants.
+# With GCC >= 10 defaulting to -fno-common these become hard multiple-definition
+# link errors; -fcommon restores the legacy tentative-definition merge.
+target_compile_options(tilelang_kernels PRIVATE -fcommon)

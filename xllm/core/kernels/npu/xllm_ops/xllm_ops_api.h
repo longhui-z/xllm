@@ -196,6 +196,32 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     int64_t cmp_ratio,
     bool return_value);
 
+std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer_v2(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& w,
+    const at::Tensor& q_descale,
+    const at::Tensor& k_descale,
+    const c10::optional<at::Tensor>& cu_seqlens_q,
+    const c10::optional<at::Tensor>& cu_seqlens_k,
+    const c10::optional<at::Tensor>& seqused_q,
+    const c10::optional<at::Tensor>& seqused_k,
+    const c10::optional<at::Tensor>& cmp_residual_k,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& output_idx_offset,
+    const c10::optional<at::Tensor>& metadata,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t topk,
+    int64_t quant_mode,
+    int64_t max_seqlen_q,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
+    int64_t cmp_ratio,
+    int64_t return_value);
+
 torch::Tensor lightning_indexer(
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -407,6 +433,26 @@ at::Tensor quant_lightning_indexer_metadata(
     int64_t sparse_mode,
     int64_t pre_tokens,
     int64_t next_tokens,
+    int64_t cmp_ratio,
+    const c10::string_view device);
+
+at::Tensor quant_lightning_indexer_v2_metadata(
+    const c10::optional<at::Tensor>& cu_seqlens_q,
+    const c10::optional<at::Tensor>& cu_seqlens_k,
+    const c10::optional<at::Tensor>& seqused_q,
+    const c10::optional<at::Tensor>& seqused_k,
+    const c10::optional<at::Tensor>& cmp_residual_k,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t topk,
+    int64_t quant_mode,
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
     int64_t cmp_ratio,
     const c10::string_view device);
 

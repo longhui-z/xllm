@@ -64,6 +64,8 @@ construct_quant_lightning_indexer_output_tensor(const at::Tensor& query,
   }
   at::Tensor sparse_indices_out =
       at::zeros(output_size, query.options().dtype(at::kInt));
+  // CANN 默认版 aclnnQuantLightningIndexer 只有 sparse_indices 单输出，
+  // sparse_values 由 wrapper 本地构造返回（不再传给 aclnn）。
   at::Tensor sparse_values_out;
   if (return_value) {
     sparse_values_out =
@@ -117,6 +119,10 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
   const int64_t state_cache_stride_dim0 = key.stride(0);
   const int64_t scale_stride_dim0 = key_dequant_scale.stride(0);
 
+  // quant_lightning_indexer 走 CANN 默认版 aclnn（xllm_ops 已禁止编译该算子），
+  // 其签名只有单输出 sparse_indices，且无
+  // metadata/cmp_ratio/return_value/stride 参数；sparse_values 仅由 wrapper
+  // 本地构造返回，不传给 aclnn。
   EXEC_NPU_CMD(aclnnQuantLightningIndexer,
                query,
                key,
@@ -126,7 +132,6 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
                actual_seq_lengths_query,
                actual_seq_lengths_key,
                block_table,
-               metadata,
                query_quant_mode,
                key_quant_mode,
                query_layout_ptr,
@@ -135,12 +140,7 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
                sparse_mode,
                pre_tokens,
                next_tokens,
-               cmp_ratio,
-               return_value,
-               state_cache_stride_dim0,
-               scale_stride_dim0,
-               sparse_indices_out,
-               sparse_values_out);
+               sparse_indices_out);
 
   return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out,
                                             sparse_values_out);

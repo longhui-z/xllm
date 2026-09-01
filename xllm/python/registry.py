@@ -79,6 +79,11 @@ def _register_builtin_models() -> None:
         "qwen3_5_moe_text",
     )
     _register_model_path(
+        "xllm.python.models.qwen3_vl",
+        "Qwen3VLForConditionalGeneration",
+        "qwen3_vl",
+    )
+    _register_model_path(
         "xllm.python.models.deepseek_v32",
         "DeepseekV3ForCausalLM",
         "deepseek_v32",
@@ -87,6 +92,12 @@ def _register_builtin_models() -> None:
         "xllm.python.models.glm5_2",
         "Glm52ForCausalLM",
         "glm_moe_dsa",
+    )
+    _register_model_path(
+        "xllm.python.models.deepseek_v4",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "deepseek_v4",
     )
 
     _register_model_path(
