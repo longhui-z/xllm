@@ -200,6 +200,15 @@ def _grouped_moe_with_selected_experts_impl(
     sorted_hidden_i8, pertoken_scale = _kernels.dynamic_quant(expanded_hidden)
     if pertoken_scale is None:
         raise RuntimeError("dynamic_quant did not return a per-token scale")
+    # dynamic_quant computes scale = max_abs / 127. For all-zero rows (empty
+    # expert groups in the expanded routing output), max_abs=0 → scale=0 →
+    # quantized = 0/0 = NaN. Replace zero scales with 1 so all-zero rows
+    # quantize to 0/1 = 0 (numerically correct).
+    pertoken_scale = torch.where(
+        pertoken_scale > 0,
+        pertoken_scale,
+        torch.ones_like(pertoken_scale),
+    )
     group_list = expert_tokens.to(torch.int64)
     gemm1_out = _group_gemm(
         x=sorted_hidden_i8,
@@ -227,6 +236,14 @@ def _grouped_moe_with_selected_experts_impl(
         glu_alpha=1.0,
         glu_bias=0.0,
     )
+    # The dequant→SwiGLU pipeline can produce inf for extreme int32 inputs,
+    # causing act_pt (the quant scale) to become inf/NaN. Clamp to prevent
+    # NaN propagation into the second group_gemm.
+    act_pt = torch.where(
+        act_pt.isnan() | (act_pt == float("inf")) | (act_pt <= 0),
+        torch.ones_like(act_pt),
+        act_pt,
+    )
     del w13_offset, w2_offset
     output = _group_gemm(
         x=act_i8,
@@ -238,6 +255,12 @@ def _grouped_moe_with_selected_experts_impl(
         group_type=0,
         group_list_type=1,
         output_dtype=hidden_states.dtype,
+    )
+    # Empty expert groups leave uninitialized rows in the group_gemm output.
+    # These garbage rows propagate as NaN through the reduce and poison the
+    # hidden states. Replace NaN with 0 (no expert contribution).
+    output = torch.where(
+        output.isnan(), torch.zeros_like(output), output
     )
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=output,

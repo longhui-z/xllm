@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import math
 import torch
 
 from xllm.python.attention.backend import (
@@ -127,6 +128,21 @@ class DsaAttentionBackend(AttentionBackend):
 
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         self._kv_caches = kv_caches
+        # The C++ side allocates the DSV4 caches with torch::empty, leaving
+        # NaN/garbage in never-written blocks. The CANN sparse_flash_mla reads
+        # beyond the committed region on the decode tiling path, so the
+        # garbage propagates into the attention output as NaN. Zero every
+        # cache tensor once at bind time.
+        for cache in self._kv_caches:
+            for name in (
+                "key", "value", "index", "conv", "ssm", "swa",
+                "compress_kv_state", "compress_score_state",
+                "compress_index_kv_state", "compress_index_score_state",
+                "indexer_scale",
+            ):
+                tensor = getattr(cache, name, None)
+                if tensor is not None and tensor.numel() > 0:
+                    tensor.zero_()
 
     def _current_forward_metadata(self) -> AttentionMetadata:
         try:
@@ -416,6 +432,58 @@ class DsaAttentionBackend(AttentionBackend):
             if use_prefill_attn
             else None
         )
+        # Decode fix for the CANN sparse_flash_mla operator: the kernel
+        # produces zero output when block_table contains non-zero block IDs
+        # at decode shapes (T=1). Copy the referenced cache blocks into a
+        # fresh 0-based compact buffer and set all block_table entries to 0.
+        if not use_prefill_attn:
+            def _compact_cache(kv, bt):
+                """Copy referenced blocks into a 0-based buffer, return
+                (compact_kv, compact_bt) with all bt entries = 0."""
+                if kv is None or bt is None:
+                    return kv, bt
+                n_seqs = bt.size(0)
+                n_cols = bt.size(1)
+                block_size = kv.size(1)
+                # Single D2H sync for the entire block table
+                bt_cpu = bt.cpu()
+                # Find max referenced block id to determine buffer size
+                max_id = 0
+                for b in range(n_seqs):
+                    for j in range(n_cols):
+                        v = int(bt_cpu[b, j])
+                        if v > max_id:
+                            max_id = v
+                total_slots = (max_id + 1) * block_size
+                compact = torch.zeros(
+                    1, total_slots, kv.size(2), kv.size(3),
+                    dtype=kv.dtype, device=kv.device,
+                )
+                compact_flat = compact.reshape(-1, kv.size(3))
+                kv_flat = kv.reshape(-1, kv.size(3))
+                for b in range(n_seqs):
+                    for j in range(n_cols):
+                        blk = int(bt_cpu[b, j])
+                        if blk < 0:
+                            continue
+                        src_start = blk * block_size
+                        dst_start = j * block_size
+                        n = min(block_size, total_slots - dst_start)
+                        if n > 0:
+                            compact_flat[dst_start:dst_start + n] = \
+                                kv_flat[src_start:src_start + n]
+                new_bt = torch.zeros(
+                    n_seqs, n_cols, dtype=torch.int32, device=kv.device
+                )
+                return compact, new_bt
+
+            ori_kv_for_attn, ori_block_table_for_attn = _compact_cache(
+                ori_kv_for_attn, ori_block_table_for_attn
+            )
+            if cmp_kv is not None:
+                cmp_kv, cmp_block_table_for_kernel = _compact_cache(
+                    cmp_kv, cmp_block_table_for_kernel
+                )
         out, _lse = _sparse_attn_sharedkv(
             _dump_layer=layer,
             q=q,
@@ -423,7 +491,7 @@ class DsaAttentionBackend(AttentionBackend):
             cmp_kv=cmp_kv if compress_ratio > 1 else None,
             ori_sparse_indices=None,
             cmp_sparse_indices=compress_topk_idxs,
-            ori_block_table=ori_block_table_for_kernel,
+            ori_block_table=ori_block_table_for_attn,
             cmp_block_table=cmp_block_table_for_kernel if compress_ratio > 1 else None,
             cu_seqlens_q=seq_q,
             cu_seqlens_ori_kv=cu_seqlens_ori_kv_for_attn,
@@ -708,8 +776,11 @@ class DsaAttentionBackend(AttentionBackend):
         dsa_dump.snap(
             "quant_lightning_indexer_metadata",
             {
-                "query_lens": query_lens,
-                "key_lens": key_lens,
+                "cu_seqlens_q": seq_q,
+                "seqused_q": query_lens,
+                "seqused_k_raw": key_lens,
+                "seqused_k_compressed": (key_lens // cmp_ratio).to(torch.int32),
+                "cmp_residual_k": (key_lens % cmp_ratio).to(torch.int32),
                 "qli_metadata": dsa.qli_metadata,
             },
             extra={"soc": current_platform.get_npu_chip(), "v2": use_v2},
@@ -964,6 +1035,13 @@ def _sparse_attn_sharedkv(**kwargs):
             dict(kwargs),
             layer=layer.layer_id,
             kind="moe" if layer.layer_id else "dense",
+            extra={
+                "source_layout_kv": "PA_ND",
+                "kernel_layout_kv": kwargs["layout_kv"],
+                "has_cmp": has_cmp,
+                "cmp_ratio": cmp_ratio,
+                "cu_seqlens_forced_none": True,
+            },
         )
     out, lse = kernels.sparse_flash_mla(**kwargs)
     if layer is not None:
