@@ -235,6 +235,31 @@ def _rank_from_ctx(ctx: dict[str, Any]) -> str | None:
     return dev
 
 
+def _env_filter_ok(layer: int | None, ctx: dict[str, Any] | None) -> bool:
+    """Optional env-gated narrowing: layers / tick range / ranks."""
+    layers_env = os.environ.get("DSA_DUMP_LAYERS", "").strip()
+    if layers_env:
+        eff_layer = layer if layer is not None else (ctx or {}).get("layer")
+        if eff_layer is not None:
+            allow = {int(x) for x in layers_env.split(",") if x.strip()}
+            if eff_layer not in allow:
+                return False
+    steps_env = os.environ.get("DSA_DUMP_STEPS", "").strip()
+    if steps_env:
+        parts = steps_env.split(":")
+        lo = int(parts[0]) if parts and parts[0] else 0
+        hi = int(parts[1]) if len(parts) > 1 and parts[1] else 1 << 62
+        tick = int((ctx or {}).get("tick", _STATE.get("tick", 0)) or 0)
+        if tick < lo or tick > hi:
+            return False
+    ranks_env = os.environ.get("DSA_DUMP_RANKS", "").strip()
+    if ranks_env:
+        allow = {x.strip() for x in ranks_env.split(",") if x.strip()}
+        if _rank_from_ctx(ctx) not in allow:
+            return False
+    return True
+
+
 def step_dir() -> str:
     ctx = ctx_get() or {}
     tick = ctx.get("tick", _STATE["tick"])
@@ -276,9 +301,14 @@ def snap(
         return
     _allowed = {"sparse_attn_sharedkv", "sparse_attn_sharedkv_out",
                 "sparse_flash_mla", "sparse_flash_mla_out",
+                "sparse_flash_mla_metadata",
+                "quant_lightning_indexer_metadata",
+                "logits",
                 "quant_lightning_indexer_v2_out", "quant_lightning_indexer_out",
                 "quant_lightning_indexer_v2", "quant_lightning_indexer"}
     if task not in _allowed:
+        return
+    if not _env_filter_ok(layer, ctx_get()):
         return
     d = step_dir()
     try:

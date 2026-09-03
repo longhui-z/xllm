@@ -261,7 +261,11 @@ class DsaAttentionBackend(AttentionBackend):
             else None
         )
         if c4css is not None and dsa.c4_pad_positions.numel() > 0:
-            c4_idx = dsa.c4_pad_positions.clamp_min(0).long().to(c4css.device)
+            c4_idx = (
+                dsa.c4_pad_positions.clamp(0, c4css.size(0) - 1).long().to(
+                    c4css.device
+                )
+            )
             dsa.c4_cos, dsa.c4_sin = (
                 tensor.contiguous()
                 for tensor in c4css.index_select(0, c4_idx).chunk(2, dim=-1)
@@ -272,8 +276,10 @@ class DsaAttentionBackend(AttentionBackend):
             else None
         )
         if c128css is not None and dsa.c128_pad_positions.numel() > 0:
-            c128_idx = dsa.c128_pad_positions.clamp_min(0).long().to(
-                c128css.device
+            c128_idx = (
+                dsa.c128_pad_positions.clamp(0, c128css.size(0) - 1).long().to(
+                    c128css.device
+                )
             )
             dsa.c128_cos, dsa.c128_sin = (
                 tensor.contiguous()
@@ -367,6 +373,20 @@ class DsaAttentionBackend(AttentionBackend):
                 cmp_block_table,
                 compress_ratio,
             )
+            if compressed is not None and compressed.detach().isnan().any():
+                from scripts.logger import logger as _dbg
+
+                _dbg.info("NAN-HUNT L%d compressor_out NaN", layer_id)
+            _kv_state = layer_cache.compress_kv_state
+            _score_state = layer_cache.compress_score_state
+            if _kv_state is not None and _kv_state.detach().isnan().any():
+                from scripts.logger import logger as _dbg
+
+                _dbg.info("NAN-HUNT L%d compressor kv_state NaN", layer_id)
+            if _score_state is not None and _score_state.detach().isnan().any():
+                from scripts.logger import logger as _dbg
+
+                _dbg.info("NAN-HUNT L%d compressor score_state NaN", layer_id)
             _scatter_by_slot(cmp_kv, cmp_slot, compressed)
             dsa_dump.snap(
                 "scatter_cmp_kv",
@@ -437,52 +457,164 @@ class DsaAttentionBackend(AttentionBackend):
         # at decode shapes (T=1). Copy the referenced cache blocks into a
         # fresh 0-based compact buffer and set all block_table entries to 0.
         if not use_prefill_attn:
-            def _compact_cache(kv, bt):
+            def _compact_cache(kv, bt, total_tokens=None, newest_slot=None,
+                               linear_base=None, copy_slots=0):
                 """Copy referenced blocks into a 0-based buffer, return
-                (compact_kv, compact_bt) with all bt entries = 0."""
+                (compact_kv, compact_bt) with all bt entries = 0.
+
+                The framework sliding-window block table can lag one block
+                behind the newest partially-written block (and reference
+                blocks already reclaimed by the SWA ring), which zeroes the
+                newest window tokens in the compact buffer and decays the
+                attention output.
+
+                With ``slot_base`` (the ring slot of token 0, derived from the
+                current step slot mapping) the compact buffer is laid out at
+                ABSOLUTE token positions: token t lives at pool slot
+                ``(slot_base + t) % ring_slots``. Only the newest
+                ``copy_slots`` tokens are gathered; older absolute slots stay
+                zero and are masked by the kernel Band mask.
+
+                With ``total_tokens`` but no ``slot_base`` (compressed caches)
+                the pool is sequential: block b holds entries
+                ``[b*block_size, ...)``.
+
+                Without ``total_tokens`` the caller-provided block table is
+                followed verbatim (allocator-agnostic fallback)."""
                 if kv is None or bt is None:
                     return kv, bt
                 n_seqs = bt.size(0)
                 n_cols = bt.size(1)
                 block_size = kv.size(1)
-                # Single D2H sync for the entire block table
-                bt_cpu = bt.cpu()
-                # Find max referenced block id to determine buffer size
-                max_id = 0
-                for b in range(n_seqs):
-                    for j in range(n_cols):
-                        v = int(bt_cpu[b, j])
-                        if v > max_id:
-                            max_id = v
-                total_slots = (max_id + 1) * block_size
-                compact = torch.zeros(
-                    1, total_slots, kv.size(2), kv.size(3),
-                    dtype=kv.dtype, device=kv.device,
-                )
-                compact_flat = compact.reshape(-1, kv.size(3))
-                kv_flat = kv.reshape(-1, kv.size(3))
-                for b in range(n_seqs):
-                    for j in range(n_cols):
-                        blk = int(bt_cpu[b, j])
-                        if blk < 0:
-                            continue
-                        src_start = blk * block_size
-                        dst_start = j * block_size
-                        n = min(block_size, total_slots - dst_start)
-                        if n > 0:
-                            compact_flat[dst_start:dst_start + n] = \
-                                kv_flat[src_start:src_start + n]
+                if total_tokens is not None and newest_slot is not None:
+                    used = max(int(total_tokens), 1)
+                    # Round up to whole blocks: the kernel addresses the
+                    # compact buffer block-wise via the all-zero block table.
+                    total_slots = (
+                        (used - 1) // block_size + 1
+                    ) * block_size
+                    compact = torch.zeros(
+                        1, total_slots, kv.size(2), kv.size(3),
+                        dtype=kv.dtype, device=kv.device,
+                    )
+                    compact_flat = compact.reshape(-1, kv.size(3))
+                    kv_flat = kv.reshape(-1, kv.size(3))
+                    # SWA ring: the sliding-window manager recycles slots
+                    # with a 2*window_size cycle inside
+                    # [block_size, block_size + 2*window_size); token t lives
+                    # at slot newest_slot - (newest_index - t) wrapped into
+                    # that range. Only the newest copy_slots tokens are
+                    # recoverable; older absolute slots stay zero and are
+                    # masked by the kernel Band mask.
+                    cycle = 2 * self.window_size
+                    slot_lo = block_size
+                    start_t = max(0, used - copy_slots)
+                    offs = torch.arange(start_t, used, device=kv.device)
+                    s = newest_slot - (used - 1 - offs)
+                    s = (s - slot_lo) % cycle + slot_lo
+                    compact_flat[start_t:used] = kv_flat[s]
+                elif total_tokens is not None and linear_base is not None:
+                    # Sequential pool (compressed caches): entry e lives at
+                    # slot linear_base + e.
+                    used = max(int(total_tokens), 1)
+                    total_slots = (
+                        (used - 1) // block_size + 1
+                    ) * block_size
+                    compact = torch.zeros(
+                        1, total_slots, kv.size(2), kv.size(3),
+                        dtype=kv.dtype, device=kv.device,
+                    )
+                    compact_flat = compact.reshape(-1, kv.size(3))
+                    kv_flat = kv.reshape(-1, kv.size(3))
+                    n_slots = min(
+                        used, kv.size(0) * block_size - linear_base
+                    )
+                    idx = linear_base + torch.arange(
+                        n_slots, device=kv.device
+                    )
+                    compact_flat[:n_slots] = kv_flat[idx]
+                else:
+                    bt_cpu = bt.cpu()
+                    max_id = 0
+                    for b in range(n_seqs):
+                        for j in range(n_cols):
+                            v = int(bt_cpu[b, j])
+                            if v > max_id:
+                                max_id = v
+                    total_slots = (max_id + 1) * block_size
+                    compact = torch.zeros(
+                        1, total_slots, kv.size(2), kv.size(3),
+                        dtype=kv.dtype, device=kv.device,
+                    )
+                    compact_flat = compact.reshape(-1, kv.size(3))
+                    kv_flat = kv.reshape(-1, kv.size(3))
+                    for b in range(n_seqs):
+                        for j in range(n_cols):
+                            blk = int(bt_cpu[b, j])
+                            if blk < 0:
+                                continue
+                            src_start = blk * block_size
+                            dst_start = j * block_size
+                            n = min(block_size, total_slots - dst_start)
+                            if n > 0:
+                                compact_flat[dst_start:dst_start + n] = \
+                                    kv_flat[src_start:src_start + n]
                 new_bt = torch.zeros(
                     n_seqs, n_cols, dtype=torch.int32, device=kv.device
                 )
                 return compact, new_bt
 
+            ori_total = None
+            if seq_kv is not None and seq_kv.numel() > 0:
+                ori_total = int(seq_kv.max().item())
+            # Slot of the newest token (index ori_total-1), read from the
+            # current step slot mapping.
+            ori_newest_slot = None
+            if (
+                ori_total is not None
+                and ori_slot is not None
+                and ori_slot.numel() > 0
+                and ori_kv_for_attn is not None
+            ):
+                ori_newest_slot = int(ori_slot.flatten()[0].item())
             ori_kv_for_attn, ori_block_table_for_attn = _compact_cache(
-                ori_kv_for_attn, ori_block_table_for_attn
+                ori_kv_for_attn, ori_block_table_for_attn,
+                total_tokens=ori_total,
+                newest_slot=ori_newest_slot,
+                copy_slots=(
+                    2 * self.window_size if ori_newest_slot is not None else 0
+                ),
             )
             if cmp_kv is not None:
+                cmp_total = (
+                    ori_total // compress_ratio
+                    if ori_total is not None and compress_ratio > 1
+                    else None
+                )
+                # The compressed cache shares the reserved-block ring layout
+                # (entry e lives at slot base+e); derive the base from the
+                # newest committed entry slot, memoizing per layer for the
+                # non-commit steps where cmp_slot is absent.
+                cmp_base = None
+                if (
+                    cmp_total
+                    and cmp_slot is not None
+                    and cmp_slot.numel() > 0
+                ):
+                    cmp_base = (
+                        int(cmp_slot.flatten()[0].item()) - (cmp_total - 1)
+                    )
+                    if not hasattr(self, "_cmp_linear_bases"):
+                        self._cmp_linear_bases = {}
+                    self._cmp_linear_bases[layer_id] = cmp_base
+                if cmp_base is None:
+                    cmp_base = getattr(self, "_cmp_linear_bases", {}).get(
+                        layer_id
+                    )
                 cmp_kv, cmp_block_table_for_kernel = _compact_cache(
-                    cmp_kv, cmp_block_table_for_kernel
+                    cmp_kv, cmp_block_table_for_kernel,
+                    total_tokens=cmp_total,
+                    linear_base=cmp_base,
                 )
         out, _lse = _sparse_attn_sharedkv(
             _dump_layer=layer,

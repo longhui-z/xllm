@@ -64,6 +64,24 @@ class PyModelBase(nn.Module):
             hidden = hidden.index_select(0, selected_idxes)
         logits = self.lm_head(hidden)
         try:
+            import os as _os
+
+            if _os.environ.get("DSA_LOGIT_DEBUG") == "1":
+                from scripts.logger import logger as _argmax_logger
+
+                top = torch.topk(logits.detach().float(), k=5, dim=-1)
+                _argmax_logger.info(
+                    "LOGIT_ARGMAX rows=%s hid_std=%.6f sel=%s "
+                    "first_row_top5_ids=%s vals=%s",
+                    tuple(logits.shape),
+                    float(hidden.detach().float().std()),
+                    selected_idxes.tolist() if selected_idxes is not None else None,
+                    top.indices[0].tolist(),
+                    [round(v, 3) for v in top.values[0].tolist()],
+                )
+        except Exception:
+            pass
+        try:
             from xllm.python import dsa_dump
 
             dsa_dump.snap("logits", {"hidden": hidden, "logits": logits})
